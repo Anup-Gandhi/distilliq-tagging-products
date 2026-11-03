@@ -39,7 +39,8 @@ def clean_row(source_row_id, base_value, raw_options, insert_dttm=None) -> Sourc
     source_row_id = str(source_row_id or "").strip()
     base_value = str(base_value or "").strip()
     options = parse_options(raw_options)
-    is_misc = not options or all(o.lower() == "none" for o in options)
+    # No real candidates (only None / Misc): still tag it, so the LLM can name the product itself.
+    is_misc = not options or all(o.lower() in ("none", MISC_OPTION.lower()) for o in options)
     if is_misc:
         options = [MISC_OPTION]  # no candidates: the LLM names the product itself
     if not source_row_id or not base_value or (not is_misc and len(options) < 2):
@@ -80,28 +81,42 @@ def _column(fieldnames: list[str], *names: str) -> str | None:
     return next((lookup[n.lower()] for n in names if n.lower() in lookup), None)
 
 
-def fetch_csv(path: str, stats: FetchStats) -> Iterator[SourceRow]:
-    """Rows from a CSV export of topk_options (sourceRowId, baseValue, options[, insert_dttm])."""
+def read_csv(path: str) -> list[dict]:
+    """Every non-blank row of a CSV, with its id, item, options and insert time columns renamed to
+    source_row_id, base_value, options and insert_dttm. All other columns are kept as they are."""
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         fields = reader.fieldnames or []
-        id_col = _column(fields, "sourceRowId", "source_row_id")
-        value_col = _column(fields, "baseValue", "base_value")
-        options_col = _column(fields, "options")
-        time_col = _column(fields, "insert_dttm", "source_insert_dttm")
-        if not (id_col and value_col and options_col):
+        columns = {"source_row_id": _column(fields, "sourceRowId", "source_row_id"),
+                   "base_value": _column(fields, "baseValue", "base_value"),
+                   "options": _column(fields, "options")}
+        if not all(columns.values()):
             raise SystemExit(f"{path} needs the columns sourceRowId, baseValue and options (found: {fields})")
+        columns["insert_dttm"] = _column(fields, "insert_dttm", "source_insert_dttm")
+        rows = []
         for r in reader:
-            stats.fetched += 1
-            insert_dttm = None
-            if time_col and r.get(time_col):
-                try:
-                    insert_dttm = datetime.fromisoformat(r[time_col].strip().replace(" UTC", "+00:00"))
-                except ValueError:
-                    pass
-            row = clean_row(r[id_col], r[value_col], r[options_col], insert_dttm)
-            if row is None:
-                stats.invalid += 1
-                stats.invalid_ids.append(str(r[id_col]))
-                continue
-            yield row
+            if not any((v or "").strip() for v in r.values() if isinstance(v, str)):
+                continue  # spreadsheet exports end with rows of empty cells
+            for name, column in columns.items():
+                if column:
+                    r[name] = r.pop(column)
+            rows.append(r)
+        return rows
+
+
+def fetch_csv(path: str, stats: FetchStats) -> Iterator[SourceRow]:
+    """Rows from a CSV export of topk_options (sourceRowId, baseValue, options[, insert_dttm])."""
+    for r in read_csv(path):
+        stats.fetched += 1
+        insert_dttm = None
+        if r.get("insert_dttm"):
+            try:
+                insert_dttm = datetime.fromisoformat(r["insert_dttm"].strip().replace(" UTC", "+00:00"))
+            except ValueError:
+                pass
+        row = clean_row(r["source_row_id"], r["base_value"], r["options"], insert_dttm)
+        if row is None:
+            stats.invalid += 1
+            stats.invalid_ids.append(str(r["source_row_id"]))
+            continue
+        yield row

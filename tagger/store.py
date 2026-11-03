@@ -1,7 +1,11 @@
 """Postgres: the source of truth for every pass."""
+from pathlib import Path
+
 from sqlalchemy import (ARRAY, Boolean, Column, DateTime, MetaData, String, Table, Text, create_engine, func,
                         select, text)
 from sqlalchemy.dialects.postgresql import JSONB, insert
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError
 
 from .bigquery_source import SourceRow
 from .claude_tagger import TagResult
@@ -67,6 +71,17 @@ claude_final_tags = Table(
     Column("skip_reason", Text),  # set when the tagger found the record too unclear; tag is then NULL
     Column("model", String(64), nullable=False),
     Column("tagged_at", DateTime(timezone=True), server_default=func.now()),
+)
+
+# Every row of each CSV given to `run --csv` or `import`, kept as uploaded.
+csv_records = Table(
+    "csv_records", metadata,
+    Column("source_row_id", String, primary_key=True),
+    Column("base_value", Text, nullable=False),
+    Column("options", Text),          # as in the file: "a | b | c"
+    Column("source_file", Text, nullable=False),
+    Column("data", JSONB, nullable=False),  # the whole row, including human tags such as tag_1 and final_tags
+    Column("tagged_at", DateTime(timezone=True), server_default=func.now()),  # when it was uploaded
 )
 
 # create_all doesn't change a table made by an earlier version.
@@ -152,9 +167,43 @@ FROM v
 DISPUTED = ("tag_1 IS NOT NULL AND (tag_2 IS NOT NULL OR skip_reason_2 IS NOT NULL) "
             "AND tags_match IS NOT TRUE AND is_alcoholic_any IS TRUE")
 
+# The human tag from an uploaded CSV next to the LLM's tag (the vote's final tag, else pass 1's).
+HUMAN_COMPARISON_VIEW = r"""
+CREATE OR REPLACE VIEW human_tag_comparison AS
+WITH h AS (
+    SELECT r.source_row_id, r.base_value, r.options, r.source_file,
+           NULLIF(trim(COALESCE(NULLIF(r.data->>'final_tags', ''), r.data->>'tag_1')), '') AS human_tag,
+           COALESCE(v.final_tag, v.tag_1) AS llm_tag,
+           v.tag_1_model AS llm_model, v.decision, v.skip_reason
+    FROM csv_records r
+    LEFT JOIN claude_tag_votes v USING (source_row_id)
+), n AS (
+    SELECT h.*,
+           -- compare ignoring "Others: ", case, punctuation and spacing
+           regexp_replace(lower(regexp_replace(human_tag, '^\s*others:\s*', '', 'i')), '[^0-9a-z]+', '', 'g') AS human_key,
+           regexp_replace(lower(llm_tag), '[^0-9a-z]+', '', 'g') AS llm_key,
+           NOT EXISTS (SELECT 1 FROM unnest(string_to_array(options, '|')) o
+                       WHERE lower(trim(o)) = lower(llm_tag)) AS llm_new_name
+    FROM h
+)
+SELECT source_row_id, base_value, options, source_file, human_tag, llm_tag, llm_model, decision, skip_reason,
+    CASE
+        WHEN human_tag IS NULL THEN 'no human tag'
+        WHEN decision = 'skipped' THEN 'llm skipped'
+        WHEN llm_tag IS NULL THEN 'not tagged by llm'
+        WHEN human_key = llm_key THEN 'same'
+        WHEN human_tag ~* '^\s*none\s*$' THEN 'human skipped'
+        -- both made up a name: the human's often has a description after it, so check these by eye
+        WHEN human_tag ~* '^\s*others:' AND llm_new_name AND lower(llm_tag) <> lower('Misc - Not a Liquor')
+            THEN 'both new name'
+        ELSE 'different'
+    END AS comparison
+FROM n
+"""
 
-def _upsert(conn, table: Table, values: dict) -> None:
-    statement = insert(table).values(**values)
+
+def _upsert(conn, table: Table, values: dict | list[dict]) -> None:
+    statement = insert(table).values(values)
     updates = {c.name: statement.excluded[c.name] for c in table.columns
                if c.name not in ("source_row_id", "tagged_at")}
     updates["tagged_at"] = func.now()
@@ -169,12 +218,35 @@ def _decision_values(result: TagResult) -> dict:
     }
 
 
+CONNECT_ARGS = {"connect_timeout": 10}
+
+
+def _create_database(database_url: str) -> None:
+    """Create the database in DATABASE_URL, connecting to the server's built-in `postgres` database to do it."""
+    url = make_url(database_url)
+    admin = create_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT", connect_args=CONNECT_ARGS)
+    try:
+        with admin.connect() as conn:
+            # template0 allows no connections, so creating can't fail with "template1 is being accessed by other users"
+            name = conn.dialect.identifier_preparer.quote(url.database)
+            conn.exec_driver_sql(f"CREATE DATABASE {name} TEMPLATE template0")
+    finally:
+        admin.dispose()
+    print(f"Created database {url.database}", flush=True)
+
+
 class Store:
     def __init__(self, database_url: str):
-        self.engine = create_engine(database_url, pool_pre_ping=True)
-        metadata.create_all(self.engine)
+        self.engine = create_engine(database_url, pool_pre_ping=True, connect_args=CONNECT_ARGS)
+        try:
+            metadata.create_all(self.engine)
+        except OperationalError as e:
+            if f'database "{make_url(database_url).database}" does not exist' not in str(e.orig):
+                raise
+            _create_database(database_url)
+            metadata.create_all(self.engine)
         with self.engine.begin() as conn:
-            for statement in MIGRATIONS + [COMPARISON_VIEW, VOTES_VIEW]:
+            for statement in MIGRATIONS + [COMPARISON_VIEW, VOTES_VIEW, HUMAN_COMPARISON_VIEW]:
                 conn.exec_driver_sql(statement)
 
     def _rows(self, statement) -> list[dict]:
@@ -253,6 +325,21 @@ class Store:
                   "model": model, **_decision_values(result)}
         with self.engine.begin() as conn:
             _upsert(conn, claude_final_tags, values)
+
+    # Uploaded CSVs
+
+    def save_csv(self, path: str, rows: list[dict]) -> int:
+        """Upsert the rows read by read_csv into csv_records. Returns how many were saved."""
+        by_id = {}  # one statement can't upsert the same id twice, so a later duplicate wins
+        for r in rows:
+            row_id, base_value = (r.get("source_row_id") or "").strip(), (r.get("base_value") or "").strip()
+            if row_id and base_value:
+                by_id[row_id] = {"source_row_id": row_id, "base_value": base_value, "options": r.get("options"),
+                                 "source_file": Path(path).name, "data": r}
+        if by_id:
+            with self.engine.begin() as conn:
+                _upsert(conn, csv_records, list(by_id.values()))
+        return len(by_id)
 
     # Export
 

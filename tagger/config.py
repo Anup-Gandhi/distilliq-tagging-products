@@ -17,7 +17,7 @@ load_dotenv(ROOT / ".env")
 DEFAULT_BIGQUERY_TABLE = "internal-apps-465610.dev_proximo_cantag.topk_options"
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
-DEFAULT_MODELS = {"anthropic": "claude-opus-5-5", "openai": "gpt-5.5", "gemini": "gemini-3-pro-preview"}
+DEFAULT_MODELS = {"anthropic": "claude-opus-5-5", "openai": "gpt-5.5", "gemini": "gemini-3.8-flash"}
 
 
 @dataclass(frozen=True)
@@ -55,12 +55,15 @@ class LLMConfig:
     effort: str = DEFAULT_EFFORT  # low | medium | high
 
 
-def provider_of_key(api_key: str) -> str:
+def provider_of_key(api_key: str) -> str | None:
+    """The provider a key belongs to, from its prefix, or None for a format we don't know."""
     if api_key.startswith("sk-ant-"):
         return "anthropic"
-    if api_key.startswith("AIza"):
+    if api_key.startswith("sk-"):
+        return "openai"
+    if api_key.startswith(("AIza", "AQ.")):  # Google's older and newer key formats
         return "gemini"
-    return "openai"
+    return None
 
 
 def provider_of_model(model: str) -> str:
@@ -111,9 +114,11 @@ def load_llm_config(name: str) -> LLMConfig:
         sys.exit(f"{path} still has the placeholder api_key. Put the real key in it first.")
     key_provider = provider_of_key(api_key)
     provider = data.get("provider", key_provider)
+    if provider is None:
+        sys.exit(f"{path}: can't tell the provider from the api_key. Add \"provider\" (anthropic, openai or gemini).")
     if provider not in DEFAULT_MODELS:
         sys.exit(f"{path}: unknown provider '{provider}' (use anthropic, openai or gemini)")
-    if provider != key_provider:
+    if key_provider is not None and provider != key_provider:
         sys.exit(f"{path}: provider is '{provider}' but the api_key looks like a {key_provider} key")
 
     model = data.get("model") or DEFAULT_MODELS[provider]

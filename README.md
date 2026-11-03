@@ -58,6 +58,7 @@ python -m tagger run --llm gemini                        # pass 1 on new BigQuer
 python -m tagger run --llm gemini --csv topk.csv         # pass 1 from a CSV export (sourceRowId, baseValue, options)
 python -m tagger retag                                   # pass 2, using the other LLM files in secrets/
 python -m tagger final --llm claude                      # pass 3
+python -m tagger import records-tina-100.csv             # upload an already-tagged CSV without tagging it
 python -m tagger export final-tags/claude_tags.csv       # add --retags for claude_retags
 ```
 
@@ -66,6 +67,11 @@ Shared options: `--max-cost USD` (default 15), `--limit N`, `--retry-errors`, `-
 
 `retag` sends each row to a provider other than the one that tagged it in pass 1, preferring Gemini, then
 Anthropic, then OpenAI among the LLM files available (or those given with `--llm`, which can be repeated).
+
+Every CSV given to `run --csv` or `import` is stored row by row in `csv_records` (the whole row is in
+`data`, including human tags). The view `human_tag_comparison` puts the human tag (`final_tags`, else
+`tag_1`) next to the LLM's tag, with `comparison` = `same`, `different`, `both new name` (check by eye),
+`human skipped`, `llm skipped`, `not tagged by llm` or `no human tag`.
 
 Rows already in Postgres are never re-read from BigQuery, so corrections made in Postgres are kept. If a run
 stops at `--max-cost`, run it again (with `--full` for `run`) to continue.

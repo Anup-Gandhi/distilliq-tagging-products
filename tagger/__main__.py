@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from itertools import islice
 
-from .bigquery_source import FetchStats, SourceRow, fetch_csv, fetch_rows
+from .bigquery_source import FetchStats, SourceRow, fetch_csv, fetch_rows, read_csv
 from .budget import Budget, BudgetExceeded
 from .claude_tagger import NONE_OPTION, ClaudeTagger, is_misc
 from .config import (DEFAULT_MODELS, EFFORTS, find_llm_configs, load_llm_config, load_settings, provider_of_model)
@@ -46,7 +46,12 @@ def _store(settings):
     from .store import Store
     if not settings.database_url:
         sys.exit("DATABASE_URL is not set in .env")
-    return Store(settings.database_url)
+    from sqlalchemy.exc import DBAPIError
+    try:
+        return Store(settings.database_url)
+    except DBAPIError as e:  # can't connect, or not allowed to create the missing database
+        message = str(e.orig).splitlines()[0] if e.orig else str(e)
+        sys.exit(f"Can't connect to Postgres (DATABASE_URL in .env): {message}")
 
 
 def _print_dry(row: SourceRow, result, model: str) -> None:
@@ -103,6 +108,8 @@ def cmd_run(args, settings):
     skip = store.tagged_ids(include_errors=True) if store else set()
     stats = FetchStats()
     if args.csv:
+        if store:
+            print(f"Uploaded {store.save_csv(args.csv, read_csv(args.csv))} rows to csv_records", file=sys.stderr)
         source = fetch_csv(args.csv, stats)
     else:
         watermark = None if (args.full or not store) else store.watermark()
@@ -226,6 +233,14 @@ def cmd_final(args, settings):
              tagged=tagged, skipped=skipped, failed=failed)
 
 
+# import
+
+def cmd_import(args, settings):
+    store = _store(settings)
+    for path in args.paths:
+        print(f"Uploaded {store.save_csv(path, read_csv(path))} rows from {path} to csv_records")
+
+
 # export
 
 def cmd_export(args, settings):
@@ -278,6 +293,10 @@ def main(argv=None):
     p = tagging("final", "pass 3: settle rows where passes 1 and 2 disagree")
     p.add_argument("--llm", default="final-tagger", help="LLM file (default final-tagger)")
     p.set_defaults(func=cmd_final)
+
+    p = commands.add_parser("import", help="upload CSV files to csv_records without tagging them")
+    p.add_argument("paths", nargs="+", metavar="PATH")
+    p.set_defaults(func=cmd_import)
 
     p = commands.add_parser("export", help="write claude_tags (or claude_retags) to a CSV file")
     p.add_argument("path")

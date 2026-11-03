@@ -8,6 +8,10 @@ PRICES = {  # USD per 1M tokens: (input, output)
     "claude-haiku-5-5": (0.10, 0.50), "claude-haiku-4-5": (1.00, 5.00),
     "gpt-5.5": (5.00, 30.00), "gpt-4.1": (2.00, 8.00), "gpt-4.1-mini": (0.40, 1.60),
     # Gemini prices are for prompts up to 200k tokens; set prices in the secrets file to override.
+    # 4-argon is $2/$10 until 30 Nov 2026, 3.8/3.6-flash $0.75/$3.75 until 31 Dec 2026; these are the later prices.
+    "gemini-4-argon": (4.00, 20.00),
+    "gemini-3.8-flash": (1.50, 7.50), "gemini-3.6-flash": (1.50, 7.50),
+    "gemini-3.5-flash-lite": (0.30, 2.50), "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-3.1-pro-preview": (2.00, 12.00), "gemini-3-pro-preview": (2.00, 12.00),
     "gemini-3-flash-preview": (0.50, 3.00),
     "gemini-2.5-pro": (1.25, 10.00), "gemini-2.5-flash": (0.30, 2.50), "gemini-2.5-flash-lite": (0.10, 0.40),
