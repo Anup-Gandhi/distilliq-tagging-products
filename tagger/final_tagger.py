@@ -17,7 +17,8 @@ def _second_pass_output(row) -> dict:
     elif name and tag.lower() == name.lower():
         answer, brand_label_name = NONE_OPTION, name
     return {"correct_answer": answer, "correct_brand_label_name": brand_label_name,
-            "correct_is_alcoholic": row["is_alcoholic_2"], "skip_reason": row["skip_reason_2"] or "",
+            "correct_is_alcoholic": row["is_alcoholic_2"],
+            "skip_reason": row["skip_reason_2"] or ("" if tag else "the second pass gave no result"),
             "explanation": row["reason_2"] or ""}
 
 

@@ -136,39 +136,38 @@ WITH v AS (
 )
 SELECT
     source_row_id, base_value, options, tag_1, tag_2, tag_3,
+    -- a pass 3 result, once there is one, outranks everything except the first two tags matching
     CASE
         WHEN tags_match THEN tag_1
-        WHEN skip_reason_1 IS NOT NULL THEN NULL
-        WHEN tag_2 IS NULL AND skip_reason_2 IS NULL THEN NULL
-        WHEN NOT is_alcoholic_any THEN 'Misc - Not a Liquor'
         WHEN tag_3_agrees_1 OR tag_3_agrees_2 THEN tag_3
+        WHEN tag_3 IS NOT NULL OR skip_reason_3 IS NOT NULL THEN NULL
+        WHEN NOT is_alcoholic_any THEN 'Misc - Not a Liquor'
     END AS final_tag,
     CASE
         WHEN tags_match THEN 'agreed'
-        WHEN skip_reason_1 IS NOT NULL THEN 'skipped'
-        WHEN tag_2 IS NULL AND skip_reason_2 IS NULL THEN 'needs retag'
-        WHEN NOT is_alcoholic_any THEN 'both not alcoholic'
-        WHEN tag_3 IS NULL AND skip_reason_3 IS NULL THEN 'needs final'
         WHEN tag_3_agrees_1 THEN 'final agrees with 1'
         WHEN tag_3_agrees_2 THEN 'final agrees with 2'
         WHEN skip_reason_3 IS NOT NULL THEN 'skipped'
-        ELSE 'no majority'
+        WHEN tag_3 IS NOT NULL THEN 'no majority'
+        WHEN NOT is_alcoholic_any THEN 'both not alcoholic'
+        WHEN tags_match IS NULL AND skip_reason_1 IS NULL THEN 'needs retag'
+        ELSE 'needs final'
     END AS decision,
     tag_1_model, tag_2_model, tag_3_model,
     CASE WHEN is_alcoholic_1 = is_alcoholic_2 THEN is_alcoholic_1 ELSE is_alcoholic_3 END AS is_alcoholic,
     is_alcoholic_1, is_alcoholic_2, is_alcoholic_3,
-    -- why the row was skipped: by pass 1 (never retagged), or by pass 3 when it couldn't settle a dispute
+    -- why the row has no tag: pass 3 couldn't settle it, or pass 1 skipped it and pass 3 hasn't run
     CASE
         WHEN tags_match THEN NULL
-        WHEN skip_reason_1 IS NOT NULL THEN skip_reason_1
         WHEN tag_3_agrees_1 OR tag_3_agrees_2 THEN NULL
-        ELSE skip_reason_3
+        ELSE COALESCE(skip_reason_3, skip_reason_1)
     END AS skip_reason
 FROM v
 """
 
-# Passes 1 and 2 side by side, and the input to pass 3. is_match is empty until both passes have given a result, so a
-# failed row never reaches pass 3; a pass 2 skip counts as not matching. Rows no pass calls alcoholic don't need pass 3.
+# Passes 1 and 2 side by side, and the input to pass 3. is_match is empty until both passes have given a result; a pass 2
+# skip counts as not matching. Pass 3 takes every row whose tags aren't a match, once pass 2 has tried it or pass 1 skipped
+# it (pass 2 never sees pass 1's skips).
 FIRST_SECOND_VIEW = """
 CREATE OR REPLACE VIEW first_second_tag_comparison AS
 WITH m AS (
@@ -194,8 +193,32 @@ WITH m AS (
     JOIN llm_tags t USING (source_row_id)
     LEFT JOIN claude_retags r USING (source_row_id)
 )
-SELECT m.*, COALESCE(NOT is_match AND is_alcoholic_any, false) AS needs_third_tag
+SELECT m.*, is_match IS NOT TRUE AND (tagged_at_2 IS NOT NULL OR skip_reason_1 IS NOT NULL) AS needs_third_tag
 FROM m
+"""
+
+# One row per item: all three tags, the final tag, why it's final (or why there isn't one), and passes 1 and 2's sources.
+FINAL_SUMMARY_VIEW = """
+CREATE OR REPLACE VIEW final_tag_summary AS
+SELECT
+    v.source_row_id, v.base_value,
+    v.tag_1 AS first_tag, v.tag_2 AS second_tag, v.tag_3 AS third_tag, v.final_tag,
+    CASE v.decision
+        WHEN 'agreed' THEN 'First and second tags match. ' || COALESCE(m.reason_2, '')
+        WHEN 'both not alcoholic' THEN 'Neither pass says it is alcoholic. ' || COALESCE(m.reason_1, m.reason_2, '')
+        WHEN 'final agrees with 1' THEN 'Third tag agrees with the first tag. ' || COALESCE(f.reason, '')
+        WHEN 'final agrees with 2' THEN 'Third tag agrees with the second tag. ' || COALESCE(f.reason, '')
+        WHEN 'skipped' THEN 'No final tag, skipped. ' || COALESCE(v.skip_reason, '')
+        WHEN 'needs retag' THEN 'No final tag yet, the second pass has no result. ' || COALESCE(m.error_2, '')
+        WHEN 'needs final' THEN 'No final tag yet, the third pass has no result. ' || COALESCE(f.error, '')
+        WHEN 'no majority' THEN 'No final tag, the third tag agrees with neither of the first two. '
+            || COALESCE(f.reason, '')
+    END AS final_tag_reason,
+    m.sources_1 AS first_tag_sources, m.sources_2 AS second_tag_sources,
+    m.tagged_at_1 AS first_tagged_at
+FROM claude_tag_votes v
+JOIN first_second_tag_comparison m USING (source_row_id)
+LEFT JOIN claude_final_tags f USING (source_row_id)
 """
 
 # The human tag from an uploaded CSV next to the LLM's tag (the vote's final tag, else pass 1's).
@@ -350,7 +373,8 @@ class Store:
             _create_database(database_url)
             metadata.create_all(self.engine)
         with self.engine.begin() as conn:
-            for statement in MIGRATIONS + [COMPARISON_VIEW, FIRST_SECOND_VIEW, VOTES_VIEW, HUMAN_COMPARISON_VIEW]:
+            for statement in MIGRATIONS + [COMPARISON_VIEW, FIRST_SECOND_VIEW, VOTES_VIEW, FINAL_SUMMARY_VIEW,
+                                           HUMAN_COMPARISON_VIEW]:
                 conn.exec_driver_sql(statement)
             if conn.exec_driver_sql("SELECT to_regclass('claude_tags')").scalar():
                 conn.exec_driver_sql(THREE_WAY_COMPARISON_VIEW)

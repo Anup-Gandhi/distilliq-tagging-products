@@ -505,7 +505,8 @@ confidence, reason, skip reason, error, sources and time, plus pass 1's selected
 `is_match` compares the tags ignoring case, outer spaces and `Others: `. A pass 2 skip is `false`. It's empty when pass 1
 gave no tag or pass 2 has no result yet (not reviewed, or failed).
 
-`needs_third_tag` is `is_match = false` and either pass says alcoholic. `final` only reads these rows.
+`needs_third_tag` is every row whose tags aren't a match, once pass 2 has tried it (even if it failed) or pass 1 skipped it.
+`final` only reads these rows. Rows pass 2 hasn't tried yet are left out.
 
 #### View `claude_tag_votes`: the final answer
 
@@ -539,6 +540,11 @@ SELECT
     is_alcoholic_1, is_alcoholic_2, is_alcoholic_3
 FROM v
 ```
+
+#### View `final_tag_summary`: one row per item
+
+`base_value`, `first_tag`, `second_tag`, `third_tag`, `final_tag`, `final_tag_reason`, `first_tag_sources`,
+`second_tag_sources` and `first_tagged_at`, plus `source_row_id`. `final_tag_reason` also says why a row has no final tag yet.
 
 #### Store methods
 
@@ -644,7 +650,7 @@ up. After a budget stop, tell the user to run again, adding `--full` for `run`.
 - [ ] Running `run` twice → the second run tags nothing new and costs nothing.
 - [ ] Edit a row in Postgres, then `run` → the edit is kept.
 - [ ] `retag` uses the other provider. `claude_tag_comparison.tags_match` ignores case, spaces and `Others: `.
-- [ ] `final` only touches disputed alcoholic rows. `claude_tag_votes.decision` gives a value for every row.
+- [ ] `final` only touches rows with `needs_third_tag`. `claude_tag_votes.decision` gives a value for every row.
 
 ---
 

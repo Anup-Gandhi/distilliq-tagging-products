@@ -1,7 +1,8 @@
 # Liquor Product Tagger
 
 Tags store item names (e.g. `1792 Full Proof Bourbon 750ml`) to catalogue names with LLMs, in three passes
-whose results live in Postgres. See [BUILD-GUIDE.md](BUILD-GUIDE.md) for the full design.
+whose results live in Postgres. See [COMMANDS.md](COMMANDS.md) for every command and [BUILD-GUIDE.md](BUILD-GUIDE.md)
+for the full design.
 
 | Pass | Command | Table | Who |
 |---|---|---|---|

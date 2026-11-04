@@ -87,6 +87,11 @@ def test_disputed_request_shows_real_names_and_both_outputs():
     _, note = disputed_request(disputed(tag_2=None, skip_reason_2="item text has no brand", is_alcoholic_2=None))
     second = json.loads(note.split("\n")[5])
     assert (second["correct_answer"], second["skip_reason"]) == ("", "item text has no brand")
+    # Pass 1 skipped and pass 2 never ran: still a valid request, showing both have no answer.
+    row, note = disputed_request(disputed(tag_1=None, tag_2=None, suggested_name_1=None, skip_reason_1="no brand"))
+    first, second = json.loads(note.split("\n")[1]), json.loads(note.split("\n")[5])
+    assert (first["answer"], first["skip_reason"]) == ("", "no brand")
+    assert second["skip_reason"] == "the second pass gave no result"
 
 
 def test_judge_results():
