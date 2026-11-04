@@ -415,33 +415,18 @@ It reuses `SYSTEM_PROMPT`, `RECORD_TAG_TOOL`, `candidates`, `user_message`, `_re
 
 ### 5.6 `final_tagger.py`: pass 3
 
-**System prompt** = the full `SYSTEM_PROMPT` above, plus:
+**System prompt** = `tagger/third_tag_system_prompt.md`. The answer comes back through the `record_decision` tool:
+`dispute_type`, `disputed_point`, `decision`, `final_tag`, `final_brand_label_name`, `final_is_alcoholic`, `explanation`.
 
-```
-
-Disputed records
-Two earlier taggers disagreed on this record. Their answers are listed after the candidates, and each earlier answer that names a product is also one of the candidates. Decide which is right by the rules above, judging every candidate on its own merits: an answer isn't more likely to be right because a tagger gave it. Pick one of the earlier answers when it names exactly the same product as the item, or another candidate if that one does instead. Answer 0 with a suggested name only when no candidate is exactly the same product, and set is_alcoholic to false when the item isn't an alcoholic drink.
-```
+`_from_judge` turns it into `record_tag`'s fields. `HUMAN`, or a win for a side that skipped, is saved as a skip.
+`save_final` also stores `decision`, `dispute_type` and `disputed_point` in `claude_final_tags`.
 
 **`is_misc(option)`**: true when the option, with `<` and `>` removed and trimmed, equals `MISC_OPTION`
 ignoring case. This also catches the `<Misc - not a Liquor>` spelling.
 
-**`disputed_request(row)`**, where `row` is a `claude_tag_comparison` row:
-
-1. Candidates = `row.options + [tag_1, tag_2]`, trimmed, without `none` or Misc, and with duplicates removed
-   ignoring case (keep the first spelling).
-2. Describe each earlier answer:
-   - empty → `no answer`
-   - Misc → `not an alcoholic drink (Misc - Not a Liquor)`
-   - found in the candidates → `candidate N, <name>`
-   - otherwise → the tag text itself
-3. Note, appended to the user message:
-   ```
-   Earlier answers (they disagree):
-   - Tagger 1: candidate 3, 1792 Full Proof Bourbon
-   - Tagger 2: candidate 4, Buffalo Trace 1792 Full Proof
-   ```
-4. Return `(SourceRow(id, base_value, candidates, None), note)`.
+**`disputed_request(row)`**, where `row` is a `first_second_tag_comparison` row, returns
+`(SourceRow(id, base_value, options, None), note)`. `options` leaves out any name pass 1 made up. `note` holds
+`<model_1_output>` and `<model_2_output>`, which `user_message` puts after the `<question>`.
 
 ### 5.7 `store.py`: Postgres
 
@@ -474,7 +459,7 @@ The old `claude_tags` table is left as it is: pass 1 now writes to `llm_tags`. T
 
 `source_row_id` (PK), `base_value`, `first_tag` (not null; pass 1's tag at the time), `first_model`,
 `tag`, `is_alcoholic`, `suggested_name`, `confidence`, `reason`, `sources`, `error`, `model`, `tagged_at`.
-**A name pass 2 makes up itself is saved as `Others: <name>`.**
+A name pass 2 makes up itself is saved as the plain name, as in pass 1. Older rows may have `Others: <name>`.
 
 #### Table `claude_final_tags`: pass 3
 
@@ -512,8 +497,15 @@ SELECT
 FROM tags
 ```
 
-**Disputed rows** (the input to pass 3):
-`tag_2 IS NOT NULL AND tags_match IS NOT TRUE AND is_alcoholic_any IS TRUE`.
+#### View `first_second_tag_comparison`: the input to pass 3
+
+Passes 1 and 2 side by side: `tag_1`, `tag_2`, `is_match`, and each pass's model, alcoholic judgment, suggested name,
+confidence, reason, skip reason, error, sources and time, plus pass 1's selected option and judgements.
+
+`is_match` compares the tags ignoring case, outer spaces and `Others: `. A pass 2 skip is `false`. It's empty when pass 1
+gave no tag or pass 2 has no result yet (not reviewed, or failed).
+
+`needs_third_tag` is `is_match = false` and either pass says alcoholic. `final` only reads these rows.
 
 #### View `claude_tag_votes`: the final answer
 
@@ -559,7 +551,7 @@ FROM v
 | `first_pass_rows()` | pass 1 rows with a tag, oldest first |
 | `first_pass_models()` | the distinct models that tagged pass 1 rows |
 | `retagged_ids(include_errors)` / `save_retag(first, result, model)` | pass 2 |
-| `disputed_rows()` | `SELECT * FROM claude_tag_comparison WHERE <disputed> ORDER BY source_row_id` |
+| `disputed_rows()` | `SELECT * FROM first_second_tag_comparison WHERE needs_third_tag ORDER BY source_row_id` |
 | `final_tagged_ids(include_errors)` / `save_final(disputed, row, result, model)` | pass 3 |
 | `all_rows()` / `all_retags()` | for `export` |
 

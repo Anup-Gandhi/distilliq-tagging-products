@@ -7,9 +7,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from itertools import islice
 
-from .bigquery_source import MISC_OPTION, FetchStats, SourceRow, fetch_csv, fetch_rows, read_csv
+from .bigquery_source import FetchStats, SourceRow, fetch_csv, fetch_rows, read_csv
 from .budget import Budget, BudgetExceeded
-from .claude_tagger import NONE_OPTION, RECORD_REVIEW_TOOL, RETAG_SYSTEM_PROMPT, ClaudeTagger, is_misc
+from .claude_tagger import (RECORD_DECISION_TOOL, RECORD_REVIEW_TOOL, RETAG_SYSTEM_PROMPT, ClaudeTagger,
+                            first_pass_output)
 from .config import (DEFAULT_MODELS, EFFORTS, find_llm_configs, load_llm_config, load_settings, provider_of_model)
 from .final_tagger import FINAL_SYSTEM_PROMPT, disputed_request
 
@@ -166,20 +167,8 @@ def _other_provider(model: str, available) -> str | None:
 
 def _retag_request(first: dict) -> tuple[SourceRow, str]:
     """The record to review and pass 1's output, as retag_system_prompt.md expects them."""
-    options = list(first["options"] or [])
-    tag = (first["tag"] or "").strip()
-    name = tag[len("Others:"):].strip() if tag.lower().startswith("others:") else tag
-    answer, brand_label_name = first["selected_option"] or tag, ""
-    if is_misc(name):
-        answer = MISC_OPTION
-    elif not first["selected_option"] and (name != tag or name == first["suggested_name"]):
-        # Pass 1 made up this name. save() stored it among the options, but it isn't a catalogue name.
-        answer, brand_label_name = NONE_OPTION, name
-        options = [o for o in options if o.lower() != name.lower()]
-    output = {"answer": answer, "is_alcoholic": first["is_alcoholic"], "brand_label_name": brand_label_name,
-              "skip_reason": first["skip_reason"] or "",
-              "name_reasons": [{"name": j["option"], "reason": j["reason"]} for j in first["judgements"] or []],
-              "confidence": first["confidence"], "reason": first["reason"]}
+    options, output = first_pass_output(first)
+    output["confidence"] = first["confidence"]
     note = f"<model_1_output>\n{json.dumps(output, ensure_ascii=False)}\n</model_1_output>"
     return SourceRow(first["source_row_id"], first["base_value"], options, first["source_insert_dttm"]), note
 
@@ -229,7 +218,7 @@ def cmd_final(args, settings):
     llm = load_llm_config(args.llm)
     budget = Budget(args.max_cost)
     tagger = _tagger(llm, budget, effort=args.effort or llm.effort, web_search=not args.no_web_search,
-                     system_prompt=FINAL_SYSTEM_PROMPT)
+                     system_prompt=FINAL_SYSTEM_PROMPT, tool=RECORD_DECISION_TOOL)
 
     done = store.final_tagged_ids(include_errors=not args.retry_errors)
     disputed = {str(r["source_row_id"]): r for r in store.disputed_rows()}

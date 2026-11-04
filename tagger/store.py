@@ -71,6 +71,9 @@ claude_final_tags = Table(
     Column("skip_reason", Text),  # set when the tagger found the record too unclear; tag is then NULL
     Column("model", String(64), nullable=False),
     Column("tagged_at", DateTime(timezone=True), server_default=func.now()),
+    Column("decision", String(10)),  # MODEL_1 | MODEL_2 | HUMAN; a HUMAN row is saved as a skip
+    Column("dispute_type", String(20)),
+    Column("disputed_point", Text),
 )
 
 # Every row of each CSV given to `run --csv` or `import`, kept as uploaded.
@@ -88,6 +91,9 @@ csv_records = Table(
 MIGRATIONS = [
     "ALTER TABLE claude_retags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
     "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
+    "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS decision VARCHAR(10)",
+    "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS dispute_type VARCHAR(20)",
+    "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS disputed_point TEXT",
 ]
 
 COMPARISON_VIEW = r"""
@@ -161,9 +167,36 @@ SELECT
 FROM v
 """
 
-# Pass 3 input: pass 2 disagreed with pass 1 (a pass 2 skip counts as disagreeing) and one of them says alcoholic.
-DISPUTED = ("tag_1 IS NOT NULL AND (tag_2 IS NOT NULL OR skip_reason_2 IS NOT NULL) "
-            "AND tags_match IS NOT TRUE AND is_alcoholic_any IS TRUE")
+# Passes 1 and 2 side by side, and the input to pass 3. is_match is empty until both passes have given a result, so a
+# failed row never reaches pass 3; a pass 2 skip counts as not matching. Rows no pass calls alcoholic don't need pass 3.
+FIRST_SECOND_VIEW = """
+CREATE OR REPLACE VIEW first_second_tag_comparison AS
+WITH m AS (
+    SELECT c.source_row_id, c.base_value, c.options, c.tag_1, c.tag_2,
+        CASE
+            WHEN c.tag_1 IS NULL THEN NULL
+            WHEN c.tag_2 IS NOT NULL THEN lower(trim(c.tag_1)) = lower(trim(c.tag_2))
+            WHEN c.skip_reason_2 IS NOT NULL THEN false
+        END AS is_match,
+        c.is_alcoholic_1, c.is_alcoholic_2, c.is_alcoholic_any,
+        c.tag_1_model, c.tag_2_model,
+        t.selected_option AS selected_option_1,
+        t.suggested_name AS suggested_name_1, r.suggested_name AS suggested_name_2,
+        t.confidence AS confidence_1, r.confidence AS confidence_2,
+        t.reason AS reason_1, r.reason AS reason_2,
+        c.skip_reason_1, c.skip_reason_2,
+        t.error AS error_1, r.error AS error_2,
+        t.judgements AS judgements_1,
+        t.sources AS sources_1, r.sources AS sources_2,
+        t.source_insert_dttm,
+        t.tagged_at AS tagged_at_1, r.tagged_at AS tagged_at_2
+    FROM claude_tag_comparison c
+    JOIN llm_tags t USING (source_row_id)
+    LEFT JOIN claude_retags r USING (source_row_id)
+)
+SELECT m.*, COALESCE(NOT is_match AND is_alcoholic_any, false) AS needs_third_tag
+FROM m
+"""
 
 # The human tag from an uploaded CSV next to the LLM's tag (the vote's final tag, else pass 1's).
 HUMAN_COMPARISON_VIEW = r"""
@@ -317,7 +350,7 @@ class Store:
             _create_database(database_url)
             metadata.create_all(self.engine)
         with self.engine.begin() as conn:
-            for statement in MIGRATIONS + [COMPARISON_VIEW, VOTES_VIEW, HUMAN_COMPARISON_VIEW]:
+            for statement in MIGRATIONS + [COMPARISON_VIEW, FIRST_SECOND_VIEW, VOTES_VIEW, HUMAN_COMPARISON_VIEW]:
                 conn.exec_driver_sql(statement)
             if conn.exec_driver_sql("SELECT to_regclass('claude_tags')").scalar():
                 conn.exec_driver_sql(THREE_WAY_COMPARISON_VIEW)
@@ -377,15 +410,13 @@ class Store:
         values = {"source_row_id": first["source_row_id"], "base_value": first["base_value"],
                   "first_tag": first["tag"], "first_model": first["model"], "model": model,
                   **_decision_values(result)}
-        if result.tag and not result.selected_option and result.tag == result.suggested_name:
-            values["tag"] = f"Others: {result.tag}"
         with self.engine.begin() as conn:
             _upsert(conn, claude_retags, values)
 
     # Pass 3
 
     def disputed_rows(self) -> list[dict]:
-        return self._rows(text(f"SELECT * FROM claude_tag_comparison WHERE {DISPUTED} ORDER BY source_row_id"))
+        return self._rows(text("SELECT * FROM first_second_tag_comparison WHERE needs_third_tag ORDER BY source_row_id"))
 
     def final_tagged_ids(self, include_errors: bool = True) -> set[str]:
         return self._ids(claude_final_tags, include_errors)
@@ -395,7 +426,8 @@ class Store:
                   "tag_1": disputed["tag_1"], "tag_2": disputed["tag_2"],
                   "tag_1_model": disputed["tag_1_model"], "tag_2_model": disputed["tag_2_model"],
                   "selected_option": result.selected_option, "judgements": result.judgements or [],
-                  "model": model, **_decision_values(result)}
+                  "decision": result.decision, "dispute_type": result.dispute_type,
+                  "disputed_point": result.disputed_point, "model": model, **_decision_values(result)}
         with self.engine.begin() as conn:
             _upsert(conn, claude_final_tags, values)
 

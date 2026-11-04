@@ -6,7 +6,7 @@ import openai
 from .bigquery_source import SourceRow
 from .budget import CACHE_READ, Budget
 from .claude_tagger import (DECISION_TOOLS, RECORD_TAG_TOOL, SYSTEM_PROMPT, TaggingError, TagResult, _result,
-                            candidates, clean_item, user_message)
+                            candidates, clean_item, parse_json, user_message)
 from .config import LLMConfig
 
 
@@ -63,7 +63,11 @@ class OpenAITagger:
                     return json.loads(item.arguments)
                 except json.JSONDecodeError as e:
                     raise TaggingError(f"{item.name} arguments aren't valid JSON: {e}")
-        raise TaggingError(f"No decision recorded (status={response.status})")
+        # "Return only this JSON" sometimes gets the JSON written out instead of sent to the tool.
+        try:
+            return parse_json(response.output_text)
+        except ValueError:
+            raise TaggingError(f"No decision recorded (status={response.status})")
 
     @staticmethod
     def _sources(response) -> list[dict]:

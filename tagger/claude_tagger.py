@@ -1,4 +1,5 @@
 """The tagging prompt, the record_tag tool, result handling (shared by every provider) and the Claude caller."""
+import json
 import re
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -61,7 +62,29 @@ RECORD_REVIEW_TOOL = {
         "additionalProperties": False,
     },
 }
-DECISION_TOOLS = (RECORD_TAG_TOOL["name"], RECORD_REVIEW_TOOL["name"])
+
+RECORD_DECISION_TOOL = {
+    "name": "record_decision",
+    "description": "Return your decision JSON by calling this tool. Call exactly once, after any searching.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "dispute_type": {"type": "string",
+                             "enum": ["SPELLING", "EXPRESSION", "PRODUCT", "MATCH", "ALCOHOLIC", "SKIP", "FORMAT"]},
+            "disputed_point": {"type": "string"},
+            "decision": {"type": "string", "enum": ["MODEL_1", "MODEL_2", "HUMAN"]},
+            "final_tag": {"type": "string"},
+            "final_brand_label_name": {"type": "string"},
+            "final_is_alcoholic": {"type": ["boolean", "null"]},  # null when HUMAN
+            "explanation": {"type": "string"},
+        },
+        "required": ["dispute_type", "disputed_point", "decision", "final_tag", "final_brand_label_name",
+                     "final_is_alcoholic", "explanation"],
+        "additionalProperties": False,
+    },
+}
+DECISION_TOOLS = (RECORD_TAG_TOOL["name"], RECORD_REVIEW_TOOL["name"], RECORD_DECISION_TOOL["name"])
 
 MAX_CONTINUATIONS = 3
 
@@ -82,6 +105,9 @@ class TagResult:
     sources: list[dict] = field(default_factory=list)     # up to 5 web pages: {"title", "url"}
     error: str | None = None
     skip_reason: str | None = None      # set when the record was too unclear to tag; tag is then None
+    decision: str | None = None         # pass 3 only: MODEL_1 | MODEL_2 | HUMAN
+    dispute_type: str | None = None     # pass 3 only
+    disputed_point: str | None = None   # pass 3 only
 
 
 def is_misc(option: str | None) -> bool:
@@ -111,19 +137,66 @@ def _key(name: str | None) -> str:
     return re.sub(r"[^0-9a-z]+", " ", (name or "").lower()).strip()
 
 
+def first_pass_output(first: dict) -> tuple[list[str], dict]:
+    """The real catalogue names and pass 1's answer, rebuilt from its stored row, for passes 2 and 3 to read."""
+    options = list(first["options"] or [])
+    tag = (first["tag"] or "").strip()
+    name = tag[len("Others:"):].strip() if tag.lower().startswith("others:") else tag
+    answer, brand_label_name = first["selected_option"] or tag, ""
+    if is_misc(name):
+        answer = MISC_OPTION
+    elif not first["selected_option"] and (name != tag or name == first["suggested_name"]):
+        # Pass 1 made up this name. save() stored it among the options, but it isn't a catalogue name.
+        answer, brand_label_name = NONE_OPTION, name
+        options = [o for o in options if o.lower() != name.lower()]
+    return options, {"answer": answer, "is_alcoholic": first["is_alcoholic"], "brand_label_name": brand_label_name,
+                     "skip_reason": first["skip_reason"] or "",
+                     "name_reasons": [{"name": j["option"], "reason": j["reason"]}
+                                      for j in first["judgements"] or []],
+                     "reason": first["reason"]}
+
+
+def parse_json(text: str) -> dict:
+    """The JSON object in a reply, allowing for a code fence or text around it. Raises ValueError if there is none."""
+    text = (text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    if fenced:
+        text = fenced.group(1)
+    elif not text.startswith("{"):
+        start, end = text.find("{"), text.rfind("}")
+        text = text[start:end + 1] if start != -1 else text
+    decision = json.loads(text)
+    if not isinstance(decision, dict):
+        raise ValueError("not a JSON object")
+    return decision
+
+
 def _from_review(review: dict) -> dict:
     """Turn a record_review answer into record_tag's fields."""
     answer, name = review.get("correct_answer") or "", review.get("correct_brand_label_name") or ""
     is_alcoholic, explanation = review.get("correct_is_alcoholic"), review.get("explanation") or ""
-    # IGNORED, or an alcoholic item the reviewer can't name: there's nothing to tag, so it's a skip like any other.
-    unclear = review["verdict"] == "IGNORED" or (_key(answer) == _key(NONE_OPTION) and not name
-                                                 and is_alcoholic is not False)
+    # IGNORED, no answer, or an alcoholic item it can't name: there's nothing to tag, so it's a skip like any other.
+    unclear = review["verdict"] == "IGNORED" or (not name and (
+        not _key(answer) or (_key(answer) == _key(NONE_OPTION) and is_alcoholic is not False)))
     return {"answer": answer, "brand_label_name": name, "is_alcoholic": is_alcoholic, "reason": explanation,
             "skip_reason": (explanation or "unclear") if unclear else ""}
 
 
+def _from_judge(judge: dict) -> dict:
+    """Turn a record_decision answer into record_tag's fields. HUMAN is saved as a skip."""
+    explanation = judge.get("explanation") or ""
+    if judge.get("decision") == "HUMAN":
+        return {"reason": explanation, "skip_reason": explanation or "needs human review"}
+    return _from_review({"verdict": "DISAGREE", "correct_answer": judge.get("final_tag"),
+                         "correct_brand_label_name": judge.get("final_brand_label_name"),
+                         "correct_is_alcoholic": judge.get("final_is_alcoholic"), "explanation": explanation})
+
+
 def _result(options: list[str], decision: dict, sources: list[dict]) -> TagResult:
-    if "verdict" in decision:
+    judge = decision if "dispute_type" in decision else {}
+    if judge:
+        decision = _from_judge(judge)
+    elif "verdict" in decision:
         decision = _from_review(decision)
     answer = (decision.get("answer") or "").strip()
     name = (decision.get("brand_label_name") or "").strip() or None
@@ -141,7 +214,8 @@ def _result(options: list[str], decision: dict, sources: list[dict]) -> TagResul
     judgements = [{"option": o, "matches": o == chosen, "reason": reason_for(n, o)} for n, o in enumerate(options)]
     result = TagResult(tag=None, is_alcoholic=is_alcoholic, suggested_name=name,
                        confidence=decision.get("confidence"), reason=decision.get("reason"),
-                       judgements=judgements, sources=sources[:5])
+                       judgements=judgements, sources=sources[:5], decision=judge.get("decision"),
+                       dispute_type=judge.get("dispute_type"), disputed_point=judge.get("disputed_point"))
 
     skip_reason = (decision.get("skip_reason") or "").strip()
     if skip_reason:
@@ -221,7 +295,11 @@ class ClaudeTagger:
         for block in response.content:
             if block.type == "tool_use" and block.name in DECISION_TOOLS:
                 return block.input
-        raise TaggingError(f"No decision recorded (stop_reason={response.stop_reason})")
+        # "Return only this JSON" sometimes gets the JSON written out instead of sent to the tool.
+        try:
+            return parse_json("".join(block.text for block in response.content if block.type == "text"))
+        except ValueError:
+            raise TaggingError(f"No decision recorded (stop_reason={response.stop_reason})")
 
     @staticmethod
     def _sources(response) -> list[dict]:

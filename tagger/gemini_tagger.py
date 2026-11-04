@@ -4,9 +4,6 @@ Gemini can't combine Google Search with function calling, so record_tag's fields
 object instead: with a response schema on Gemini 3, or described in the prompt on Gemini 2.x, which
 doesn't allow a schema together with search.
 """
-import json
-import re
-
 import httpx
 from google import genai
 from google.genai import errors, types
@@ -14,7 +11,7 @@ from google.genai import errors, types
 from .bigquery_source import SourceRow
 from .budget import CACHE_READ, Budget
 from .claude_tagger import (RECORD_TAG_TOOL, SYSTEM_PROMPT, TaggingError, TagResult, _result, candidates,
-                            clean_item, user_message)
+                            clean_item, parse_json, user_message)
 from .config import LLMConfig
 
 JSON_ANSWER = """
@@ -33,20 +30,6 @@ def _schema(schema):
     if isinstance(schema, list):
         return [_schema(v) for v in schema]
     return schema
-
-
-def _parse_json(text: str) -> dict:
-    text = (text or "").strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
-    if fenced:
-        text = fenced.group(1)
-    elif not text.startswith("{"):
-        start, end = text.find("{"), text.rfind("}")
-        text = text[start:end + 1] if start != -1 else text
-    decision = json.loads(text)
-    if not isinstance(decision, dict):
-        raise ValueError("not a JSON object")
-    return decision
 
 
 class GeminiTagger:
@@ -129,7 +112,7 @@ class GeminiTagger:
         parts = getattr(response.candidates[0].content, "parts", None) or []
         text = "".join(p.text for p in parts if getattr(p, "text", None) and not getattr(p, "thought", False))
         try:
-            return _parse_json(text)
+            return parse_json(text)
         except ValueError:
             raise TaggingError(f"No decision recorded (finish_reason={finish_name})")
 

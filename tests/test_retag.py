@@ -1,7 +1,10 @@
 import json
 
+from types import SimpleNamespace
+
 from tagger.__main__ import _retag_request
-from tagger.claude_tagger import _result, user_message
+from tagger.claude_tagger import ClaudeTagger, _result, user_message
+from tagger.final_tagger import disputed_request
 
 
 def first(**kw):
@@ -57,3 +60,57 @@ def test_review_results():
     # A reviewer that calls pass 1's name a guess gives no name: a skip, not an error.
     unclear = _result(options, review(), [])
     assert (unclear.tag, unclear.skip_reason, unclear.error) == (None, "why", None)
+
+
+def disputed(**kw):
+    return {"source_row_id": "1", "base_value": "Titos 1L", "options": ["A Vodka", "Titos Vodka"], "tag_1": "Titos Vodka",
+            "tag_2": "A Vodka", "selected_option_1": None, "suggested_name_1": "Titos Vodka", "suggested_name_2": None,
+            "is_alcoholic_1": True, "is_alcoholic_2": True, "skip_reason_1": None, "skip_reason_2": None,
+            "judgements_1": [], "reason_1": "first", "reason_2": "second", **kw}
+
+
+def judge(decision="MODEL_1", tag="None of the above", name="Titos Vodka", alcoholic=True):
+    return {"dispute_type": "MATCH", "disputed_point": "point", "decision": decision, "final_tag": tag,
+            "final_brand_label_name": name, "final_is_alcoholic": alcoholic, "explanation": "why"}
+
+
+def test_disputed_request_shows_real_names_and_both_outputs():
+    row, note = disputed_request(disputed())
+    assert row.options == ["A Vodka"]
+    assert note.startswith("<model_1_output>\n") and "</model_1_output>\n\n<model_2_output>\n" in note
+    first, second = json.loads(note.split("\n")[1]), json.loads(note.split("\n")[5])
+    assert (first["answer"], first["brand_label_name"]) == ("None of the above", "Titos Vodka")
+    assert (second["correct_answer"], second["explanation"]) == ("A Vodka", "second")
+    _, note = disputed_request(disputed(tag_2="New Vodka", suggested_name_2="New Vodka"))
+    second = json.loads(note.split("\n")[5])
+    assert (second["correct_answer"], second["correct_brand_label_name"]) == ("None of the above", "New Vodka")
+    _, note = disputed_request(disputed(tag_2=None, skip_reason_2="item text has no brand", is_alcoholic_2=None))
+    second = json.loads(note.split("\n")[5])
+    assert (second["correct_answer"], second["skip_reason"]) == ("", "item text has no brand")
+
+
+def test_judge_results():
+    options = ["A Vodka"]
+    named = _result(options, judge(), [])
+    assert (named.tag, named.decision, named.dispute_type, named.disputed_point) == (
+        "Titos Vodka", "MODEL_1", "MATCH", "point")
+    assert _result(options, judge("MODEL_2", "A Vodka", ""), []).selected_option == "A Vodka"
+    assert _result(options, judge("MODEL_2", "Misc - Not a Liquor", "", False), []).tag == "Misc - Not a Liquor"
+    human = _result(options, judge("HUMAN", "", "", None), [])
+    assert (human.tag, human.skip_reason, human.decision, human.error) == (None, "why", "HUMAN", None)
+    # Model 2 skipped and won: the skip stands, whatever it said about alcohol.
+    for alcoholic in (None, False):
+        won = _result(options, judge("MODEL_2", "", "", alcoholic), [])
+        assert (won.tag, won.skip_reason, won.error) == (None, "why", None)
+
+
+def test_json_written_as_text_counts_as_the_answer():
+    fenced = '```json\n{"verdict": "AGREE", "correct_answer": "A Vodka"}\n```'
+    response = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=fenced)])
+    assert ClaudeTagger._decision(response)["verdict"] == "AGREE"
+    try:
+        ClaudeTagger._decision(SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text="no")]))
+    except Exception as e:
+        assert "No decision recorded" in str(e)
+    else:
+        raise AssertionError("expected a TaggingError")
