@@ -5,29 +5,23 @@ import openai
 
 from .bigquery_source import SourceRow
 from .budget import CACHE_READ, Budget
-from .claude_tagger import (RECORD_TAG_TOOL, SYSTEM_PROMPT, TaggingError, TagResult, _result, candidates,
-                            clean_item, user_message)
+from .claude_tagger import (DECISION_TOOLS, RECORD_TAG_TOOL, SYSTEM_PROMPT, TaggingError, TagResult, _result,
+                            candidates, clean_item, user_message)
 from .config import LLMConfig
-
-RECORD_TAG_FUNCTION = {
-    "type": "function",
-    "name": RECORD_TAG_TOOL["name"],
-    "description": RECORD_TAG_TOOL["description"],
-    "strict": True,
-    "parameters": RECORD_TAG_TOOL["input_schema"],
-}
 
 
 class OpenAITagger:
     def __init__(self, llm: LLMConfig, budget: Budget, effort: str = "medium", web_search: bool = True,
-                 system_prompt: str = SYSTEM_PROMPT):
+                 system_prompt: str = SYSTEM_PROMPT, tool: dict = RECORD_TAG_TOOL):
         self.llm = llm
         self.model = llm.model
         self.budget = budget
         self.effort = effort
         self.system_prompt = system_prompt
         self.client = openai.OpenAI(api_key=llm.api_key, timeout=180.0, max_retries=4)
-        self.tools = [{"type": "web_search"}, RECORD_TAG_FUNCTION] if web_search else [RECORD_TAG_FUNCTION]
+        function = {"type": "function", "name": tool["name"], "description": tool["description"], "strict": True,
+                    "parameters": tool["input_schema"]}
+        self.tools = [{"type": "web_search"}, function] if web_search else [function]
 
     def tag(self, row: SourceRow, note: str | None = None) -> TagResult:
         options = candidates(row)
@@ -64,11 +58,11 @@ class OpenAITagger:
     @staticmethod
     def _decision(response) -> dict:
         for item in response.output:
-            if item.type == "function_call" and item.name == "record_tag":
+            if item.type == "function_call" and item.name in DECISION_TOOLS:
                 try:
                     return json.loads(item.arguments)
                 except json.JSONDecodeError as e:
-                    raise TaggingError(f"record_tag arguments aren't valid JSON: {e}")
+                    raise TaggingError(f"{item.name} arguments aren't valid JSON: {e}")
         raise TaggingError(f"No decision recorded (status={response.status})")
 
     @staticmethod

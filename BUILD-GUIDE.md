@@ -17,7 +17,7 @@ does that job with LLMs instead:
 
 1. **Pass 1, `run`:** an LLM picks the candidate that is exactly the same product, or answers "none" and
    suggests a new catalogue name, or says the item isn't alcoholic.
-2. **Pass 2, `retag`:** the *other* LLM provider tags the same rows again, without seeing pass 1's answer.
+2. **Pass 2, `retag`:** the *other* LLM provider reviews pass 1's answer and gives the correct result.
 3. **Pass 3, `final`:** for rows where passes 1 and 2 disagree, a third LLM call sees both answers and picks
    the best one.
 4. **Vote:** a Postgres view takes the final tag by 2-of-3 majority.
@@ -29,7 +29,7 @@ and the tagger never overwrites a row that is already there, unless you retry er
 BigQuery topk_options
    │  fetch + clean (bigquery_source.py)
    ▼
-SourceRow ──► Pass 1: run ────► claude_tags          (provider A, e.g. Claude)
+SourceRow ──► Pass 1: run ────► llm_tags             (provider A, e.g. Claude)
                  │
                  ▼
               Pass 2: retag ──► claude_retags        (the other provider, e.g. OpenAI)
@@ -87,7 +87,7 @@ distilliq-tagging-products/
 | `.venv/` | Virtual environment | Create it with `python -m venv .venv`. Don't copy it. |
 | `.vscode/settings.json` | `{"python.terminal.useEnvFile": true}` | Optional convenience. |
 | `README.md` | Human quick-start | Keep it in sync with the CLI. |
-| `claude_tags.csv` | An early 100-row export of `claude_tags` | **Not the source of truth.** It uses the old `Others: <name>` format. Always read from Postgres. |
+| `claude_tags.csv` | An early 100-row export of the old `claude_tags` table | **Not the source of truth.** It uses the old `Others: <name>` format. Always read from Postgres. |
 | `requirements.txt` | Pinned dependencies | See section 3. |
 
 ### 2.2 `final-tags/`: exported results
@@ -445,13 +445,12 @@ ignoring case. This also catches the `<Misc - not a Liquor>` spelling.
 
 ### 5.7 `store.py`: Postgres
 
-Use SQLAlchemy Core with the `psycopg` driver. On connect, run `metadata.create_all`, then this `ALTER`,
-because `create_all` doesn't change a table made by an earlier version:
-`ALTER TABLE claude_tags ADD COLUMN IF NOT EXISTS judgements JSONB NOT NULL DEFAULT '[]'`.
-Then create or replace both views. Every write is an **upsert** on `source_row_id`
+Use SQLAlchemy Core with the `psycopg` driver. On connect, run `metadata.create_all`, then the `MIGRATIONS`
+(`ADD COLUMN IF NOT EXISTS` statements), because `create_all` doesn't change a table made by an earlier version.
+The old `claude_tags` table is left as it is: pass 1 now writes to `llm_tags`. Then create or replace both views. Every write is an **upsert** on `source_row_id`
 (`INSERT ... ON CONFLICT DO UPDATE` of every column except the key, with `tagged_at = now()`).
 
-#### Table `claude_tags`: pass 1
+#### Table `llm_tags`: pass 1
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -498,7 +497,7 @@ WITH tags AS (
         t.is_alcoholic AS is_alcoholic_1, r.is_alcoholic AS is_alcoholic_2,
         r.source_row_id IS NOT NULL AS retagged,
         f.tag AS tag_3, f.model AS tag_3_model, f.is_alcoholic AS is_alcoholic_3
-    FROM claude_tags t
+    FROM llm_tags t
     LEFT JOIN claude_retags r USING (source_row_id)
     LEFT JOIN claude_final_tags f USING (source_row_id)
 )
@@ -553,8 +552,8 @@ FROM v
 
 | Method | Does |
 |---|---|
-| `watermark()` | `MAX(claude_tags.source_insert_dttm)` |
-| `tagged_ids(include_errors)` | ids in `claude_tags` (optionally only the ones without an error) |
+| `watermark()` | `MAX(llm_tags.source_insert_dttm)` |
+| `tagged_ids(include_errors)` | ids in `llm_tags` (optionally only the ones without an error) |
 | `save(row, result, model)` | upserts pass 1. Appends the suggested name to `options` when the tag is that name. |
 | `error_rows()` | pass 1 rows with an error, oldest first, **as stored**, including human edits |
 | `first_pass_rows()` | pass 1 rows with a tag, oldest first |
@@ -575,7 +574,7 @@ FROM v
 
 1. Load the LLM config. Unless this is a dry run, open the Store.
 2. Watermark: `store.watermark()`, or none with `--full`.
-3. `skip` = every id already in `claude_tags`, **including errors**. Rows already in Postgres are never read
+3. `skip` = every id already in `llm_tags`, **including errors**. Rows already in Postgres are never read
    again from BigQuery, so human edits there are kept.
 4. Pending rows = BigQuery rows newer than the watermark and not in `skip`. With `--retry-errors`, the
    stored error rows go first, rebuilt from Postgres.
@@ -587,11 +586,13 @@ FROM v
 1. Each first-pass row is retagged by the **other provider**: a row tagged by a `claude*` model goes to
    OpenAI, and any other row goes to Anthropic. Use `find_llm_config(provider)`, or the file given with
    `--llm` for that provider (`--llm` can be repeated).
-2. Candidates = pass 1's stored options. If pass 1 suggested a name, add it as one more option when it isn't
-   already there. For old rows, the name is the tag with `Others: ` removed. Pass 1's choice is **not** shown
-   to the model.
-3. Skip rows already in `claude_retags`. Rows that failed are skipped too, unless `--retry-errors` is set.
-4. Save with `save_retag`.
+2. Use `tagger/retag_system_prompt.md` and the `record_review` tool. The message is `<question>` (pass 1's
+   stored options, minus any name pass 1 made up) and `<model_1_output>` (pass 1's answer). For old rows, the
+   made-up name is the tag with `Others: ` removed.
+3. `_from_review` turns the review into `record_tag`'s fields: `correct_answer` becomes the tag, and IGNORED, or
+   "None of the above" with no name on an alcoholic item, becomes a skip.
+4. Skip rows already in `claude_retags`. Rows that failed are skipped too, unless `--retry-errors` is set.
+5. Save with `save_retag`.
 
 #### `final [--llm NAME]`: pass 3
 
@@ -601,7 +602,7 @@ FROM v
 
 #### `export PATH [--retags]`
 
-Writes `claude_tags`, or `claude_retags` with `--retags`, to a CSV file. `options` is joined with ` | `, and
+Writes `llm_tags`, or `claude_retags` with `--retags`, to a CSV file. `options` is joined with ` | `, and
 `judgements` and `sources` are written as JSON.
 
 #### The parallel loop (`_tag_rows`)
@@ -631,7 +632,7 @@ up. After a budget stop, tell the user to run again, adding `--full` for `run`.
 3. `bigquery_source.py`. Test that `parse_options` and `clean_row` behave as in section 5.3.
 4. `claude_tagger.py`: the prompt, tool, request and `_result`. Try it on one hard-coded `SourceRow`.
 5. `__main__.py` with only `run --dry-run`. Check the JSON for 5 rows.
-6. `store.py` with `claude_tags`, then `run` without `--dry-run`, then `export`.
+6. `store.py` with `llm_tags`, then `run` without `--dry-run`, then `export`.
 7. `openai_tagger.py`, then `retag` and `claude_retags`, then the `claude_tag_comparison` view.
 8. `final_tagger.py`, then `final`, `claude_final_tags` and the `claude_tag_votes` view.
 9. A README.

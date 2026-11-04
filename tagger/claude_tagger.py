@@ -1,5 +1,6 @@
 """The tagging prompt, the record_tag tool, result handling (shared by every provider) and the Claude caller."""
 import re
+from pathlib import Path
 from dataclasses import dataclass, field
 
 import anthropic
@@ -16,55 +17,8 @@ QUESTION = ("Which name most properly identifies {item} - {names} ? "
             "If none of the names identify {item}, what is the most proper Brand + Label name for {item} ?")
 SEPARATOR = " OR "
 
-SYSTEM_PROMPT = """You tag retail product records for a liquor catalogue, answering the same question a human tagger would ask Google.
-
-Each record is a question about one item as it appears in a store's data, often abbreviated and with sizes and pack counts. The question offers catalogue names separated by OR, then "Misc - Not a Liquor" and "None of the above", and asks which name most properly identifies the item, whether the item is alcoholic, and what the most proper Brand + Label name is when none of the names identify it.
-
-Which name most properly identifies the item
-A catalogue name identifies the item only when it names exactly the same product. These differences are ignored:
-- sizes (such as 750ml or 1.75L), pack counts and pack wording (such as 6pk, 12 x 355ml or Pack);
-- proof and ABV (such as 100 Proof, 90pf or 40%), unless they are part of the product's name, as in "1792 Full Proof";
-- letter case, punctuation and spacing ("W.L. Weller" is "W L Weller");
-- standard abbreviations and their full forms ("Yr" is "Year").
-The one exception is a variety pack: "Variety Pack" must be in both the item and the catalogue name, or in neither. For the item "Truly Variety Pack 12pk", "Truly Hard Seltzer Variety Pack" can identify it but "Truly Wild Berry" can't.
-Everything else must be the same: the brand, product line, flavour/expression and age statement. A name does not identify the item when it names a different brand, adds a word the item doesn't have (such as a parent company or distillery name, but not the liquor type, see below) or lacks one it has, or names a different expression of the same brand, or only the brand. A wrong match is worse than no match.
-
-For example, for the item "1792 Full Proof Bourbon 750ml":
-- "1792 Full Proof Bourbon 1.75L" identifies it (only the size differs);
-- "Buffalo Trace 1792 Full Proof" does not (it adds Buffalo Trace and lacks Bourbon);
-- "W L Weller Full Proof" does not (different brand).
-With only the last two offered, the answer is "None of the above" with the Brand + Label name "1792 Full Proof Bourbon".
-
-Liquor type
-The tag must say what type of drink the product is, such as tequila, bourbon, whiskey, rum, vodka, gin, brandy, cognac, liqueur, wine, champagne, beer or hard seltzer. A wine's grape or style (such as Cabernet Sauvignon or Prosecco) and a beer's style (such as IPA or Lager) count as its type.
-- A catalogue name may add the type when the item leaves it out: for the item "Titos 1.75L", "Tito's Handmade Vodka" identifies it, because Tito's Handmade is a vodka.
-- Only pick a catalogue name that contains the type. If the only catalogue name that identifies the item has no type, such as "Tito's Handmade", answer "None of the above" and give the Brand + Label name with the type, "Tito's Handmade Vodka".
-- When neither the item nor the catalogue names say the type, search to find it.
-This doesn't apply to "Misc - Not a Liquor".
-
-If several catalogue names identify the item equally well, pick the first. Choose "Misc - Not a Liquor" only when the item is clearly not an alcoholic drink: food (such as pizza, noodles, chips or candy), mixers and soft drinks, tobacco, glassware, bags, deposits and so on. Choose "None of the above" when the item is clearly an alcoholic drink you can identify, but no catalogue name identifies it.
-
-Brand + Label name
-When the answer is "None of the above", give the product's most proper Brand + Label name, written so it would look like one more catalogue name: Title Case, abbreviations written out, in the usual order of brand, age, product line, expression and type, such as "Whistlepig 6 Year Piggyback Rye Whiskey". It must contain the liquor type. Use the name the brand itself sells the product under. Leave out sizes, pack counts, proof or ABV (unless part of the product's name), store codes and stray punctuation.
-
-Web search
-How you decide depends on whether the item names a liquor type, such as tequila, bourbon, whiskey, vodka, rum, gin, brandy, cognac, liqueur, wine, champagne, beer, lager, IPA, hard seltzer or cider:
-- If it does, decide from the name alone, without searching.
-- If it doesn't, search for the item name and decide from what the results say the product is and what type of drink it is.
-Also search when you need the product's real Brand + Label name, or its type for the tag. Don't search to confirm a decision you can already make.
-
-Skipping
-Skip the record when it is still unclear after searching: you can't tell what the item is, whether it is alcoholic, what type of drink it is, or whether a catalogue name identifies it. A skipped record goes to a person, so skip rather than guess. To skip, answer "None of the above", leave brand_label_name "" and say in skip_reason what is unclear, such as "search results don't say what WTRK 101 is" or "can't tell whether the item is the 12 Year or the 18 Year". Don't skip just because no catalogue name identifies the item: when you know what the product is, give its Brand + Label name instead.
-
-Answer
-When you have decided, record your answer once with record_tag:
-- answer: the chosen name copied exactly from the question: one of the catalogue names, "Misc - Not a Liquor" or "None of the above".
-- name_reasons: one entry per catalogue name in the question, in order, each a short phrase saying why it does or doesn't identify the item, such as "only the size differs" or "different brand (W L Weller)". Empty when no catalogue names are offered.
-- is_alcoholic: whether the item is an alcoholic drink.
-- brand_label_name: when the answer is "None of the above" and you aren't skipping, the most proper Brand + Label name. Otherwise "".
-- skip_reason: when you skip, one sentence saying what is unclear. Otherwise "".
-- confidence: high when the item text clearly identifies the product and the decision is clear-cut, medium when you had to interpret the item text, low when it is too vague to be sure.
-- reason: one sentence explaining the final decision."""
+SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
+RETAG_SYSTEM_PROMPT = (Path(__file__).parent / "retag_system_prompt.md").read_text(encoding="utf-8")
 
 RECORD_TAG_TOOL = {
     "name": "record_tag",
@@ -89,6 +43,25 @@ RECORD_TAG_TOOL = {
         "additionalProperties": False,
     },
 }
+
+RECORD_REVIEW_TOOL = {
+    "name": "record_review",
+    "description": "Return your review JSON by calling this tool. Call exactly once, after any searching.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ["AGREE", "DISAGREE", "IGNORED"]},
+            "correct_answer": {"type": "string"},
+            "correct_brand_label_name": {"type": "string"},
+            "correct_is_alcoholic": {"type": ["boolean", "null"]},  # null when IGNORED
+            "explanation": {"type": "string"},
+        },
+        "required": ["verdict", "correct_answer", "correct_brand_label_name", "correct_is_alcoholic", "explanation"],
+        "additionalProperties": False,
+    },
+}
+DECISION_TOOLS = (RECORD_TAG_TOOL["name"], RECORD_REVIEW_TOOL["name"])
 
 MAX_CONTINUATIONS = 3
 
@@ -128,6 +101,8 @@ def clean_item(text: str) -> str:
 def user_message(item: str, options: list[str], note: str | None = None) -> str:
     names = SEPARATOR.join([*options, MISC_OPTION, NONE_OPTION])
     message = QUESTION.format(item=item, names=names)
+    if note and note.startswith("<model_1_output>"):  # the input format retag_system_prompt.md describes
+        return f"<question>\n{message}\n</question>\n\n{note}"
     return f"{message}\n\n{note}" if note else message
 
 
@@ -136,7 +111,20 @@ def _key(name: str | None) -> str:
     return re.sub(r"[^0-9a-z]+", " ", (name or "").lower()).strip()
 
 
+def _from_review(review: dict) -> dict:
+    """Turn a record_review answer into record_tag's fields."""
+    answer, name = review.get("correct_answer") or "", review.get("correct_brand_label_name") or ""
+    is_alcoholic, explanation = review.get("correct_is_alcoholic"), review.get("explanation") or ""
+    # IGNORED, or an alcoholic item the reviewer can't name: there's nothing to tag, so it's a skip like any other.
+    unclear = review["verdict"] == "IGNORED" or (_key(answer) == _key(NONE_OPTION) and not name
+                                                 and is_alcoholic is not False)
+    return {"answer": answer, "brand_label_name": name, "is_alcoholic": is_alcoholic, "reason": explanation,
+            "skip_reason": (explanation or "unclear") if unclear else ""}
+
+
 def _result(options: list[str], decision: dict, sources: list[dict]) -> TagResult:
+    if "verdict" in decision:
+        decision = _from_review(decision)
     answer = (decision.get("answer") or "").strip()
     name = (decision.get("brand_label_name") or "").strip() or None
     is_alcoholic = decision.get("is_alcoholic")
@@ -175,7 +163,7 @@ def _result(options: list[str], decision: dict, sources: list[dict]) -> TagResul
 
 class ClaudeTagger:
     def __init__(self, llm: LLMConfig, budget: Budget, effort: str = "medium", web_search: bool = True,
-                 system_prompt: str = SYSTEM_PROMPT):
+                 system_prompt: str = SYSTEM_PROMPT, tool: dict = RECORD_TAG_TOOL):
         self.llm = llm
         self.model = llm.model
         self.budget = budget
@@ -185,7 +173,7 @@ class ClaudeTagger:
         self.haiku = "haiku" in llm.model
         tool_type = "web_search_20250305" if self.haiku else "web_search_20260209"
         search = {"type": tool_type, "name": "web_search", "max_uses": 2}
-        self.tools = [search, RECORD_TAG_TOOL] if web_search else [RECORD_TAG_TOOL]
+        self.tools = [search, tool] if web_search else [tool]
 
     def tag(self, row: SourceRow, note: str | None = None) -> TagResult:
         options = candidates(row)
@@ -231,7 +219,7 @@ class ClaudeTagger:
         if response.stop_reason == "refusal":
             raise TaggingError("Claude declined to tag this record")
         for block in response.content:
-            if block.type == "tool_use" and block.name == "record_tag":
+            if block.type == "tool_use" and block.name in DECISION_TOOLS:
                 return block.input
         raise TaggingError(f"No decision recorded (stop_reason={response.stop_reason})")
 

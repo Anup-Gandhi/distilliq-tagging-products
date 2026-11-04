@@ -5,8 +5,8 @@ whose results live in Postgres. See [BUILD-GUIDE.md](BUILD-GUIDE.md) for the ful
 
 | Pass | Command | Table | Who |
 |---|---|---|---|
-| 1 | `run` | `claude_tags` | the LLM you pick |
-| 2 | `retag` | `claude_retags` | a different provider, without seeing pass 1's answer |
+| 1 | `run` | `llm_tags` | the LLM you pick |
+| 2 | `retag` | `claude_retags` | a different provider reviews pass 1's answer (prompt: `tagger/retag_system_prompt.md`) |
 | 3 | `final` | `claude_final_tags` | settles rows where 1 and 2 disagree |
 | vote | view `claude_tag_votes` | | `final_tag` by 2 of 3 |
 
@@ -59,7 +59,7 @@ python -m tagger run --llm gemini --csv topk.csv         # pass 1 from a CSV exp
 python -m tagger retag                                   # pass 2, using the other LLM files in secrets/
 python -m tagger final --llm claude                      # pass 3
 python -m tagger import records-tina-100.csv             # upload an already-tagged CSV without tagging it
-python -m tagger export final-tags/claude_tags.csv       # add --retags for claude_retags
+python -m tagger export final-tags/llm_tags.csv       # add --retags for claude_retags
 ```
 
 Shared options: `--max-cost USD` (default 15), `--limit N`, `--retry-errors`, `--workers N`,

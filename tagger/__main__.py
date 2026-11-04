@@ -7,9 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from itertools import islice
 
-from .bigquery_source import FetchStats, SourceRow, fetch_csv, fetch_rows, read_csv
+from .bigquery_source import MISC_OPTION, FetchStats, SourceRow, fetch_csv, fetch_rows, read_csv
 from .budget import Budget, BudgetExceeded
-from .claude_tagger import NONE_OPTION, ClaudeTagger, is_misc
+from .claude_tagger import NONE_OPTION, RECORD_REVIEW_TOOL, RETAG_SYSTEM_PROMPT, ClaudeTagger, is_misc
 from .config import (DEFAULT_MODELS, EFFORTS, find_llm_configs, load_llm_config, load_settings, provider_of_model)
 from .final_tagger import FINAL_SYSTEM_PROMPT, disputed_request
 
@@ -164,15 +164,24 @@ def _other_provider(model: str, available) -> str | None:
     return next((p for p in RETAG_PREFERENCE if p != first and p in available), None)
 
 
-def _retag_row(first: dict) -> SourceRow:
+def _retag_request(first: dict) -> tuple[SourceRow, str]:
+    """The record to review and pass 1's output, as retag_system_prompt.md expects them."""
     options = list(first["options"] or [])
     tag = (first["tag"] or "").strip()
     name = tag[len("Others:"):].strip() if tag.lower().startswith("others:") else tag
-    # Pass 1's suggested name joins the options, but its choice isn't shown.
-    if name and not first["selected_option"] and not is_misc(name) and name.lower() != NONE_OPTION.lower() \
-            and name.lower() not in (o.lower() for o in options):
-        options.append(name)
-    return SourceRow(first["source_row_id"], first["base_value"], options, first["source_insert_dttm"])
+    answer, brand_label_name = first["selected_option"] or tag, ""
+    if is_misc(name):
+        answer = MISC_OPTION
+    elif not first["selected_option"] and (name != tag or name == first["suggested_name"]):
+        # Pass 1 made up this name. save() stored it among the options, but it isn't a catalogue name.
+        answer, brand_label_name = NONE_OPTION, name
+        options = [o for o in options if o.lower() != name.lower()]
+    output = {"answer": answer, "is_alcoholic": first["is_alcoholic"], "brand_label_name": brand_label_name,
+              "skip_reason": first["skip_reason"] or "",
+              "name_reasons": [{"name": j["option"], "reason": j["reason"]} for j in first["judgements"] or []],
+              "confidence": first["confidence"], "reason": first["reason"]}
+    note = f"<model_1_output>\n{json.dumps(output, ensure_ascii=False)}\n</model_1_output>"
+    return SourceRow(first["source_row_id"], first["base_value"], options, first["source_insert_dttm"]), note
 
 
 def cmd_retag(args, settings):
@@ -190,7 +199,8 @@ def cmd_retag(args, settings):
                      "Add one to secrets/ or pass --llm.")
         route[model] = provider
     taggers = {p: _tagger(configs[p], budget, effort=args.effort or configs[p].effort,
-                          web_search=not args.no_web_search)
+                          web_search=not args.no_web_search, system_prompt=RETAG_SYSTEM_PROMPT,
+                          tool=RECORD_REVIEW_TOOL)
                for p in set(route.values())}
     for model, provider in route.items():
         print(f"Pass 1 rows by {model} -> retagged by {taggers[provider].model}", file=sys.stderr)
@@ -202,9 +212,10 @@ def cmd_retag(args, settings):
     def tagger_for(row):
         return taggers[route[firsts[row.source_row_id]["model"]]]
 
-    rows = (_retag_row(r) for r in firsts.values())
+    requests = {i: _retag_request(r) for i, r in firsts.items()}
     tagged, skipped, failed, stopped = _run_loop(
-        _limited(rows, args.limit), lambda row: tagger_for(row).tag(row),
+        _limited((row for row, _ in requests.values()), args.limit),
+        lambda row: tagger_for(row).tag(row, note=requests[row.source_row_id][1]),
         lambda row, result: store.save_retag(firsts[row.source_row_id], result, tagger_for(row).model),
         args, budget, lambda row: tagger_for(row).model)
     _summary(budget, stopped, "same command", first_pass_rows=len(firsts) + already, already_retagged=already,
@@ -298,7 +309,7 @@ def main(argv=None):
     p.add_argument("paths", nargs="+", metavar="PATH")
     p.set_defaults(func=cmd_import)
 
-    p = commands.add_parser("export", help="write claude_tags (or claude_retags) to a CSV file")
+    p = commands.add_parser("export", help="write llm_tags (or claude_retags) to a CSV file")
     p.add_argument("path")
     p.add_argument("--retags", action="store_true")
     p.set_defaults(func=cmd_export)

@@ -12,8 +12,8 @@ from .claude_tagger import TagResult
 
 metadata = MetaData()
 
-claude_tags = Table(
-    "claude_tags", metadata,
+llm_tags = Table(
+    "llm_tags", metadata,
     Column("source_row_id", String, primary_key=True),
     Column("base_value", Text, nullable=False),
     Column("options", ARRAY(String), nullable=False),
@@ -86,8 +86,6 @@ csv_records = Table(
 
 # create_all doesn't change a table made by an earlier version.
 MIGRATIONS = [
-    "ALTER TABLE claude_tags ADD COLUMN IF NOT EXISTS judgements JSONB NOT NULL DEFAULT '[]'",
-    "ALTER TABLE claude_tags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
     "ALTER TABLE claude_retags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
     "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
 ]
@@ -106,7 +104,7 @@ WITH tags AS (
         r.source_row_id IS NOT NULL AS retagged,
         f.tag AS tag_3, f.model AS tag_3_model, f.is_alcoholic AS is_alcoholic_3,
         t.skip_reason AS skip_reason_1, r.skip_reason AS skip_reason_2, f.skip_reason AS skip_reason_3
-    FROM claude_tags t
+    FROM llm_tags t
     LEFT JOIN claude_retags r USING (source_row_id)
     LEFT JOIN claude_final_tags f USING (source_row_id)
 )
@@ -201,6 +199,79 @@ SELECT source_row_id, base_value, options, source_file, human_tag, llm_tag, llm_
 FROM n
 """
 
+# The old claude_tags, the new llm_tags and the human tag from an uploaded CSV, side by side, for every record in any
+# of them. Only created when claude_tags exists, since it's no longer in `metadata`.
+THREE_WAY_COMPARISON_VIEW = r"""
+CREATE OR REPLACE VIEW three_way_tag_comparison AS
+WITH ids AS (
+    SELECT source_row_id FROM csv_records
+    UNION SELECT source_row_id FROM claude_tags
+    UNION SELECT source_row_id FROM llm_tags
+), j AS (
+    SELECT i.source_row_id,
+           COALESCE(h.base_value, c.base_value, l.base_value) AS base_value,
+           COALESCE(h.options, array_to_string(COALESCE(l.options, c.options), ' | ')) AS options,
+           h.source_file,
+           h.source_row_id IS NOT NULL AS in_csv,
+           NULLIF(trim(COALESCE(NULLIF(h.data->>'final_tags', ''), h.data->>'tag_1')), '') AS human_tag,
+           c.source_row_id IS NOT NULL AS in_claude, c.tag AS claude_tag, c.model AS claude_model,
+           c.skip_reason AS claude_skip_reason, c.error AS claude_error,
+           l.source_row_id IS NOT NULL AS in_llm, l.tag AS llm_tag, l.model AS llm_model,
+           l.skip_reason AS llm_skip_reason, l.error AS llm_error
+    FROM ids i
+    LEFT JOIN csv_records h USING (source_row_id)
+    LEFT JOIN claude_tags c USING (source_row_id)
+    LEFT JOIN llm_tags l USING (source_row_id)
+), n AS (
+    -- compare ignoring "Others: ", case, punctuation and spacing (also turns "<Misc - not a Liquor>" into the plain form)
+    SELECT j.*,
+           regexp_replace(lower(regexp_replace(human_tag, '^\s*others:\s*', '', 'i')), '[^0-9a-z]+', '', 'g') AS human_key,
+           regexp_replace(lower(regexp_replace(claude_tag, '^\s*others:\s*', '', 'i')), '[^0-9a-z]+', '', 'g') AS claude_key,
+           regexp_replace(lower(regexp_replace(llm_tag, '^\s*others:\s*', '', 'i')), '[^0-9a-z]+', '', 'g') AS llm_key
+    FROM j
+)
+SELECT source_row_id, base_value, options, source_file, human_tag, claude_tag, llm_tag, claude_model, llm_model,
+    claude_skip_reason, llm_skip_reason, claude_error, llm_error,
+    CASE
+        WHEN NOT in_claude THEN 'not in claude_tags'
+        WHEN NOT in_llm THEN 'not in llm_tags'
+        WHEN claude_error IS NOT NULL OR llm_error IS NOT NULL THEN 'error'
+        WHEN claude_tag IS NULL AND llm_tag IS NULL THEN 'both skipped'
+        WHEN claude_tag IS NULL THEN 'claude skipped'
+        WHEN llm_tag IS NULL THEN 'llm skipped'
+        WHEN claude_key = llm_key THEN 'same'
+        ELSE 'different'
+    END AS claude_vs_llm,
+    CASE
+        WHEN human_tag IS NULL THEN 'no human tag'
+        WHEN NOT in_claude THEN 'not in claude_tags'
+        WHEN claude_error IS NOT NULL THEN 'error'
+        WHEN claude_tag IS NULL THEN 'claude skipped'
+        WHEN human_key = claude_key THEN 'same'
+        WHEN human_tag ~* '^\s*none\s*$' THEN 'human skipped'
+        ELSE 'different'
+    END AS human_vs_claude,
+    CASE
+        WHEN human_tag IS NULL THEN 'no human tag'
+        WHEN NOT in_llm THEN 'not in llm_tags'
+        WHEN llm_error IS NOT NULL THEN 'error'
+        WHEN llm_tag IS NULL THEN 'llm skipped'
+        WHEN human_key = llm_key THEN 'same'
+        WHEN human_tag ~* '^\s*none\s*$' THEN 'human skipped'
+        ELSE 'different'
+    END AS human_vs_llm,
+    CASE
+        WHEN human_tag IS NULL OR claude_tag IS NULL OR llm_tag IS NULL THEN 'not all tagged'
+        WHEN human_tag ~* '^\s*none\s*$' THEN 'human skipped'
+        WHEN claude_key = llm_key AND llm_key = human_key THEN 'all same'
+        WHEN claude_key = llm_key THEN 'human differs'
+        WHEN claude_key = human_key THEN 'llm differs'
+        WHEN llm_key = human_key THEN 'claude differs'
+        ELSE 'all different'
+    END AS claude_vs_llm_vs_human
+FROM n
+"""
+
 
 def _upsert(conn, table: Table, values: dict | list[dict]) -> None:
     statement = insert(table).values(values)
@@ -248,6 +319,8 @@ class Store:
         with self.engine.begin() as conn:
             for statement in MIGRATIONS + [COMPARISON_VIEW, VOTES_VIEW, HUMAN_COMPARISON_VIEW]:
                 conn.exec_driver_sql(statement)
+            if conn.exec_driver_sql("SELECT to_regclass('claude_tags')").scalar():
+                conn.exec_driver_sql(THREE_WAY_COMPARISON_VIEW)
 
     def _rows(self, statement) -> list[dict]:
         with self.engine.connect() as conn:
@@ -264,10 +337,10 @@ class Store:
 
     def watermark(self):
         with self.engine.connect() as conn:
-            return conn.execute(select(func.max(claude_tags.c.source_insert_dttm))).scalar()
+            return conn.execute(select(func.max(llm_tags.c.source_insert_dttm))).scalar()
 
     def tagged_ids(self, include_errors: bool = True) -> set[str]:
-        return self._ids(claude_tags, include_errors)
+        return self._ids(llm_tags, include_errors)
 
     def save(self, row: SourceRow, result: TagResult, model: str) -> None:
         options = list(row.options)
@@ -278,22 +351,22 @@ class Store:
                   "selected_option": result.selected_option, "judgements": result.judgements or [],
                   "model": model, "source_insert_dttm": row.insert_dttm, **_decision_values(result)}
         with self.engine.begin() as conn:
-            _upsert(conn, claude_tags, values)
+            _upsert(conn, llm_tags, values)
 
     def error_rows(self) -> list[dict]:
         """Failed pass 1 rows, oldest first, as stored (including human edits)."""
-        statement = (select(claude_tags).where(claude_tags.c.error.is_not(None))
-                     .order_by(claude_tags.c.source_insert_dttm.asc().nulls_first(), claude_tags.c.source_row_id))
+        statement = (select(llm_tags).where(llm_tags.c.error.is_not(None))
+                     .order_by(llm_tags.c.source_insert_dttm.asc().nulls_first(), llm_tags.c.source_row_id))
         return self._rows(statement)
 
     def first_pass_rows(self) -> list[dict]:
-        statement = (select(claude_tags).where(claude_tags.c.tag.is_not(None))
-                     .order_by(claude_tags.c.source_insert_dttm.asc().nulls_first(), claude_tags.c.source_row_id))
+        statement = (select(llm_tags).where(llm_tags.c.tag.is_not(None))
+                     .order_by(llm_tags.c.source_insert_dttm.asc().nulls_first(), llm_tags.c.source_row_id))
         return self._rows(statement)
 
     def first_pass_models(self) -> list[str]:
         with self.engine.connect() as conn:
-            return list(conn.execute(select(claude_tags.c.model).distinct()).scalars())
+            return list(conn.execute(select(llm_tags.c.model).distinct()).scalars())
 
     # Pass 2
 
@@ -344,7 +417,7 @@ class Store:
     # Export
 
     def all_rows(self) -> list[dict]:
-        return self._rows(select(claude_tags).order_by(claude_tags.c.source_row_id))
+        return self._rows(select(llm_tags).order_by(llm_tags.c.source_row_id))
 
     def all_retags(self) -> list[dict]:
         return self._rows(select(claude_retags).order_by(claude_retags.c.source_row_id))

@@ -51,7 +51,7 @@ def _parse_json(text: str) -> dict:
 
 class GeminiTagger:
     def __init__(self, llm: LLMConfig, budget: Budget, effort: str = "medium", web_search: bool = True,
-                 system_prompt: str = SYSTEM_PROMPT):
+                 system_prompt: str = SYSTEM_PROMPT, tool: dict = RECORD_TAG_TOOL):
         self.llm = llm
         self.model = llm.model
         self.budget = budget
@@ -64,10 +64,11 @@ class GeminiTagger:
         if web_search:
             config["tools"] = [types.Tool(google_search=types.GoogleSearch())]
         if web_search and self.gemini_2:
-            config["system_instruction"] = system_prompt + JSON_ANSWER
+            if tool is RECORD_TAG_TOOL:  # the review prompt already spells out its JSON
+                config["system_instruction"] = system_prompt + JSON_ANSWER
         else:
             config["response_mime_type"] = "application/json"
-            config["response_json_schema"] = _schema(RECORD_TAG_TOOL["input_schema"])
+            config["response_json_schema"] = _schema(tool["input_schema"])
         self.config = types.GenerateContentConfig(**config)
 
     def _thinking(self, effort: str) -> types.ThinkingConfig:
