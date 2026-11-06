@@ -12,7 +12,8 @@ from . import budget
 ROOT = Path(__file__).resolve().parent.parent
 SECRETS = ROOT / "secrets"
 
-load_dotenv(ROOT / ".env")
+# override: a terminal can hold old values (VS Code's useEnvFile copies .env into it), and .env must win over those
+load_dotenv(ROOT / ".env", override=True)
 
 DEFAULT_BIGQUERY_TABLE = "internal-apps-465610.dev_proximo_cantag.topk_options"
 EFFORTS = ("low", "medium", "high")

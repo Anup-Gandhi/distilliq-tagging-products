@@ -32,11 +32,11 @@ llm_tags = Table(
     Column("tagged_at", DateTime(timezone=True), server_default=func.now()),
 )
 
-claude_retags = Table(
-    "claude_retags", metadata,
+llm_retags = Table(
+    "llm_retags", metadata,
     Column("source_row_id", String, primary_key=True),
     Column("base_value", Text, nullable=False),
-    Column("first_tag", Text, nullable=False),
+    Column("first_tag", Text),  # NULL when pass 1 skipped or failed
     Column("first_model", String(64)),
     Column("tag", Text),
     Column("is_alcoholic", Boolean),
@@ -50,8 +50,8 @@ claude_retags = Table(
     Column("tagged_at", DateTime(timezone=True), server_default=func.now()),
 )
 
-claude_final_tags = Table(
-    "claude_final_tags", metadata,
+llm_final_tags = Table(
+    "llm_final_tags", metadata,
     Column("source_row_id", String, primary_key=True),
     Column("base_value", Text, nullable=False),
     Column("options", ARRAY(String), nullable=False),
@@ -89,15 +89,16 @@ csv_records = Table(
 
 # create_all doesn't change a table made by an earlier version.
 MIGRATIONS = [
-    "ALTER TABLE claude_retags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
-    "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
-    "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS decision VARCHAR(10)",
-    "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS dispute_type VARCHAR(20)",
-    "ALTER TABLE claude_final_tags ADD COLUMN IF NOT EXISTS disputed_point TEXT",
+    "ALTER TABLE llm_retags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
+    "ALTER TABLE llm_final_tags ADD COLUMN IF NOT EXISTS skip_reason TEXT",
+    "ALTER TABLE llm_final_tags ADD COLUMN IF NOT EXISTS decision VARCHAR(10)",
+    "ALTER TABLE llm_final_tags ADD COLUMN IF NOT EXISTS dispute_type VARCHAR(20)",
+    "ALTER TABLE llm_final_tags ADD COLUMN IF NOT EXISTS disputed_point TEXT",
+    "ALTER TABLE llm_retags ALTER COLUMN first_tag DROP NOT NULL",
 ]
 
 COMPARISON_VIEW = r"""
-CREATE OR REPLACE VIEW claude_tag_comparison AS
+CREATE OR REPLACE VIEW llm_tag_comparison AS
 WITH tags AS (
     SELECT
         t.source_row_id, t.base_value, t.options,
@@ -111,8 +112,8 @@ WITH tags AS (
         f.tag AS tag_3, f.model AS tag_3_model, f.is_alcoholic AS is_alcoholic_3,
         t.skip_reason AS skip_reason_1, r.skip_reason AS skip_reason_2, f.skip_reason AS skip_reason_3
     FROM llm_tags t
-    LEFT JOIN claude_retags r USING (source_row_id)
-    LEFT JOIN claude_final_tags f USING (source_row_id)
+    LEFT JOIN llm_retags r USING (source_row_id)
+    LEFT JOIN llm_final_tags f USING (source_row_id)
 )
 SELECT
     source_row_id, base_value, options, tag_1, tag_2,
@@ -127,12 +128,12 @@ FROM tags
 """
 
 VOTES_VIEW = """
-CREATE OR REPLACE VIEW claude_tag_votes AS
+CREATE OR REPLACE VIEW llm_tag_votes AS
 WITH v AS (
     SELECT c.*,
            lower(trim(tag_3)) = lower(trim(tag_1)) AS tag_3_agrees_1,
            lower(trim(tag_3)) = lower(trim(tag_2)) AS tag_3_agrees_2
-    FROM claude_tag_comparison c
+    FROM llm_tag_comparison c
 )
 SELECT
     source_row_id, base_value, options, tag_1, tag_2, tag_3,
@@ -150,13 +151,13 @@ SELECT
         WHEN skip_reason_3 IS NOT NULL THEN 'skipped'
         WHEN tag_3 IS NOT NULL THEN 'no majority'
         WHEN NOT is_alcoholic_any THEN 'both not alcoholic'
-        WHEN tags_match IS NULL AND skip_reason_1 IS NULL THEN 'needs retag'
+        WHEN tags_match IS NULL THEN 'needs retag'
         ELSE 'needs final'
     END AS decision,
     tag_1_model, tag_2_model, tag_3_model,
     CASE WHEN is_alcoholic_1 = is_alcoholic_2 THEN is_alcoholic_1 ELSE is_alcoholic_3 END AS is_alcoholic,
     is_alcoholic_1, is_alcoholic_2, is_alcoholic_3,
-    -- why the row has no tag: pass 3 couldn't settle it, or pass 1 skipped it and pass 3 hasn't run
+    -- why the row has no tag: pass 3 couldn't settle it, or pass 1 skipped it and passes 2 and 3 haven't settled it
     CASE
         WHEN tags_match THEN NULL
         WHEN tag_3_agrees_1 OR tag_3_agrees_2 THEN NULL
@@ -166,8 +167,7 @@ FROM v
 """
 
 # Passes 1 and 2 side by side, and the input to pass 3. is_match is empty until both passes have given a result; a pass 2
-# skip counts as not matching. Pass 3 takes every row whose tags aren't a match, once pass 2 has tried it or pass 1 skipped
-# it (pass 2 never sees pass 1's skips).
+# skip counts as not matching. Pass 3 takes every row whose tags aren't a match, once pass 2 has tried it.
 FIRST_SECOND_VIEW = """
 CREATE OR REPLACE VIEW first_second_tag_comparison AS
 WITH m AS (
@@ -189,11 +189,11 @@ WITH m AS (
         t.sources AS sources_1, r.sources AS sources_2,
         t.source_insert_dttm,
         t.tagged_at AS tagged_at_1, r.tagged_at AS tagged_at_2
-    FROM claude_tag_comparison c
+    FROM llm_tag_comparison c
     JOIN llm_tags t USING (source_row_id)
-    LEFT JOIN claude_retags r USING (source_row_id)
+    LEFT JOIN llm_retags r USING (source_row_id)
 )
-SELECT m.*, is_match IS NOT TRUE AND (tagged_at_2 IS NOT NULL OR skip_reason_1 IS NOT NULL) AS needs_third_tag
+SELECT m.*, is_match IS NOT TRUE AND tagged_at_2 IS NOT NULL AS needs_third_tag
 FROM m
 """
 
@@ -216,9 +216,9 @@ SELECT
     END AS final_tag_reason,
     m.sources_1 AS first_tag_sources, m.sources_2 AS second_tag_sources,
     m.tagged_at_1 AS first_tagged_at
-FROM claude_tag_votes v
+FROM llm_tag_votes v
 JOIN first_second_tag_comparison m USING (source_row_id)
-LEFT JOIN claude_final_tags f USING (source_row_id)
+LEFT JOIN llm_final_tags f USING (source_row_id)
 """
 
 # The human tag from an uploaded CSV next to the LLM's tag (the vote's final tag, else pass 1's).
@@ -230,7 +230,7 @@ WITH h AS (
            COALESCE(v.final_tag, v.tag_1) AS llm_tag,
            v.tag_1_model AS llm_model, v.decision, v.skip_reason
     FROM csv_records r
-    LEFT JOIN claude_tag_votes v USING (source_row_id)
+    LEFT JOIN llm_tag_votes v USING (source_row_id)
 ), n AS (
     SELECT h.*,
            -- compare ignoring "Others: ", case, punctuation and spacing
@@ -417,8 +417,7 @@ class Store:
         return self._rows(statement)
 
     def first_pass_rows(self) -> list[dict]:
-        statement = (select(llm_tags).where(llm_tags.c.tag.is_not(None))
-                     .order_by(llm_tags.c.source_insert_dttm.asc().nulls_first(), llm_tags.c.source_row_id))
+        statement = select(llm_tags).order_by(llm_tags.c.source_insert_dttm.asc().nulls_first(), llm_tags.c.source_row_id)
         return self._rows(statement)
 
     def first_pass_models(self) -> list[str]:
@@ -428,14 +427,14 @@ class Store:
     # Pass 2
 
     def retagged_ids(self, include_errors: bool = True) -> set[str]:
-        return self._ids(claude_retags, include_errors)
+        return self._ids(llm_retags, include_errors)
 
     def save_retag(self, first: dict, result: TagResult, model: str) -> None:
         values = {"source_row_id": first["source_row_id"], "base_value": first["base_value"],
                   "first_tag": first["tag"], "first_model": first["model"], "model": model,
                   **_decision_values(result)}
         with self.engine.begin() as conn:
-            _upsert(conn, claude_retags, values)
+            _upsert(conn, llm_retags, values)
 
     # Pass 3
 
@@ -443,7 +442,7 @@ class Store:
         return self._rows(text("SELECT * FROM first_second_tag_comparison WHERE needs_third_tag ORDER BY source_row_id"))
 
     def final_tagged_ids(self, include_errors: bool = True) -> set[str]:
-        return self._ids(claude_final_tags, include_errors)
+        return self._ids(llm_final_tags, include_errors)
 
     def save_final(self, disputed: dict, row: SourceRow, result: TagResult, model: str) -> None:
         values = {"source_row_id": row.source_row_id, "base_value": row.base_value, "options": row.options,
@@ -453,7 +452,7 @@ class Store:
                   "decision": result.decision, "dispute_type": result.dispute_type,
                   "disputed_point": result.disputed_point, "model": model, **_decision_values(result)}
         with self.engine.begin() as conn:
-            _upsert(conn, claude_final_tags, values)
+            _upsert(conn, llm_final_tags, values)
 
     # Uploaded CSVs
 
@@ -476,4 +475,4 @@ class Store:
         return self._rows(select(llm_tags).order_by(llm_tags.c.source_row_id))
 
     def all_retags(self) -> list[dict]:
-        return self._rows(select(claude_retags).order_by(claude_retags.c.source_row_id))
+        return self._rows(select(llm_retags).order_by(llm_retags.c.source_row_id))

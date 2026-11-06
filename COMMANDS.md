@@ -6,8 +6,8 @@ folder in PowerShell. See [README.md](README.md) for what each pass does.
 | Step | Command | Saves to |
 |---|---|---|
 | Pass 1: tag items | `run` | `llm_tags` |
-| Pass 2: review pass 1 | `retag` | `claude_retags` |
-| Pass 3: judge the rows that didn't match | `final` | `claude_final_tags` |
+| Pass 2: review pass 1 | `retag` | `llm_retags` |
+| Pass 3: judge the rows that didn't match | `final` | `llm_final_tags` |
 | Results | view `final_tag_summary` | |
 
 ## 1. Setup
@@ -123,7 +123,7 @@ How many rows reached each outcome:
 
 ```sql
 SELECT decision, count(*) AS rows, count(final_tag) AS with_final_tag
-FROM claude_tag_votes
+FROM llm_tag_votes
 GROUP BY decision
 ORDER BY rows DESC;
 ```
@@ -132,7 +132,7 @@ The judge's decisions:
 
 ```sql
 SELECT base_value, tag_1, tag_2, tag, decision, dispute_type, disputed_point, reason
-FROM claude_final_tags
+FROM llm_final_tags
 ORDER BY decision;
 ```
 
@@ -140,7 +140,7 @@ Rows sent to a person:
 
 ```sql
 SELECT base_value, tag_1, tag_2, skip_reason
-FROM claude_final_tags
+FROM llm_final_tags
 WHERE decision = 'HUMAN';
 ```
 
@@ -177,8 +177,8 @@ result first. **This can't be undone**, so look at the rows before you delete th
 One item:
 
 ```sql
-SELECT base_value, tag, decision FROM claude_final_tags WHERE base_value = 'Don Ramon - Plata Tequila';
-DELETE FROM claude_final_tags WHERE base_value = 'Don Ramon - Plata Tequila';
+SELECT base_value, tag, decision FROM llm_final_tags WHERE base_value = 'Don Ramon - Plata Tequila';
+DELETE FROM llm_final_tags WHERE base_value = 'Don Ramon - Plata Tequila';
 ```
 
 Then run `final` again:
@@ -192,8 +192,8 @@ python -m tagger final --max-cost 5
 Delete the pass 3 results first, because the retry clears the errors this query looks for:
 
 ```sql
-DELETE FROM claude_final_tags
-WHERE source_row_id IN (SELECT source_row_id FROM claude_retags WHERE error IS NOT NULL);
+DELETE FROM llm_final_tags
+WHERE source_row_id IN (SELECT source_row_id FROM llm_retags WHERE error IS NOT NULL);
 ```
 
 Then re-run the reviews and judge whatever still doesn't match:

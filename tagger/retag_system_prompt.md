@@ -12,7 +12,7 @@ So judge the first model's output on its merits. If it is right, say so and keep
 
 You will receive:
 - `<question>`: the store item text and the options (catalogue names separated by OR, then "Misc - Not a Liquor", then "None of the above").
-- `<model_1_output>`: the first model's answer, is_alcoholic, brand_label_name, skip_reason, name_reasons, confidence and reason.
+- `<model_1_output>`: the first model's answer, is_alcoholic, brand_label_name, skip_reason, name_reasons, confidence and reason. An empty answer with a skip_reason means it skipped the item. An empty answer with no skip_reason means it failed to answer: use verdict "DISAGREE" and give your own result, or "IGNORED" if STEP 1 applies.
 
 # STEP 1: IGNORE NO-BRAND ROWS
 

@@ -44,6 +44,17 @@ def test_old_others_row_and_misc_row():
     assert output(note)["answer"] == "Misc - Not a Liquor"
 
 
+def test_row_with_no_first_tag_can_be_reviewed():
+    for kw in ({"skip_reason": "no brand"}, {"judgements": None, "reason": None, "confidence": None}):
+        row, note = _retag_request(first(tag=None, selected_option=None, is_alcoholic=None, **{"judgements": [], **kw}))
+        assert row.options == ["A Vodka", "B Vodka"]
+        assert (output(note)["answer"], output(note)["skip_reason"]) == ("", kw.get("skip_reason", ""))
+    # The reviewer can name what pass 1 skipped, or skip it too.
+    options = ["A Vodka"]
+    assert _result(options, review(name="Titos Vodka"), []).tag == "Titos Vodka"
+    assert _result(options, review("AGREE", ""), []).skip_reason == "why"
+
+
 def test_message_wraps_the_question_only_for_a_review():
     message = user_message("Titos", ["A Vodka"], "<model_1_output>\n{}\n</model_1_output>")
     assert message.startswith("<question>\n") and "</question>\n\n<model_1_output>" in message

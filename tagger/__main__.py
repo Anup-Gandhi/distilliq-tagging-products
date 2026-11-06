@@ -298,7 +298,7 @@ def main(argv=None):
     p.add_argument("paths", nargs="+", metavar="PATH")
     p.set_defaults(func=cmd_import)
 
-    p = commands.add_parser("export", help="write llm_tags (or claude_retags) to a CSV file")
+    p = commands.add_parser("export", help="write llm_tags (or llm_retags) to a CSV file")
     p.add_argument("path")
     p.add_argument("--retags", action="store_true")
     p.set_defaults(func=cmd_export)

@@ -7,9 +7,9 @@ for the full design.
 | Pass | Command | Table | Who |
 |---|---|---|---|
 | 1 | `run` | `llm_tags` | the LLM you pick |
-| 2 | `retag` | `claude_retags` | a different provider reviews pass 1's answer (prompt: `tagger/retag_system_prompt.md`) |
-| 3 | `final` | `claude_final_tags` | settles rows where 1 and 2 disagree |
-| vote | view `claude_tag_votes` | | `final_tag` by 2 of 3 |
+| 2 | `retag` | `llm_retags` | a different provider reviews pass 1's answer (prompt: `tagger/retag_system_prompt.md`) |
+| 3 | `final` | `llm_final_tags` | settles rows where 1 and 2 disagree |
+| vote | view `llm_tag_votes` | | `final_tag` by 2 of 3 |
 
 ## Setup
 
@@ -46,8 +46,9 @@ write a Brand + Label name. Choosing `None of the above` makes the Brand + Label
 Matching ignores sizes, pack counts and proof, but "Variety Pack" must appear on both sides or neither. An
 item that names a liquor type is decided from its name; one that doesn't is searched first. When a record is
 still unclear after searching, it is **skipped**: `tag` stays empty and `skip_reason` says why, so a person
-can review it. Skipped rows aren't errors, so `--retry-errors` leaves them alone. In `claude_tag_votes` they
-show as `decision = 'skipped'` with the reason in `skip_reason`.
+can review it. Skipped rows aren't errors, so `--retry-errors` leaves them alone. `retag` also reviews rows
+with no first tag, skipped or failed, and `final` waits until `retag` has tried them. When pass 3 skips a row,
+`llm_tag_votes` shows `decision = 'skipped'` with the reason in `skip_reason`.
 
 Gemini answers with Grounding with Google Search, the same search behind AI Overviews.
 
@@ -60,7 +61,7 @@ python -m tagger run --llm gemini --csv topk.csv         # pass 1 from a CSV exp
 python -m tagger retag                                   # pass 2, using the other LLM files in secrets/
 python -m tagger final --llm claude                      # pass 3
 python -m tagger import records-tina-100.csv             # upload an already-tagged CSV without tagging it
-python -m tagger export final-tags/llm_tags.csv       # add --retags for claude_retags
+python -m tagger export final-tags/llm_tags.csv       # add --retags for llm_retags
 ```
 
 Shared options: `--max-cost USD` (default 15), `--limit N`, `--retry-errors`, `--workers N`,

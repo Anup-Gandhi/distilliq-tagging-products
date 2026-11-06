@@ -32,16 +32,16 @@ BigQuery topk_options
 SourceRow ──► Pass 1: run ────► llm_tags             (provider A, e.g. Claude)
                  │
                  ▼
-              Pass 2: retag ──► claude_retags        (the other provider, e.g. OpenAI)
+              Pass 2: retag ──► llm_retags        (the other provider, e.g. OpenAI)
                  │
                  ▼
-        view claude_tag_comparison (tag_1 vs tag_2, tags_match)
+        view llm_tag_comparison (tag_1 vs tag_2, tags_match)
                  │  disputed rows only
                  ▼
-              Pass 3: final ──► claude_final_tags    (any provider)
+              Pass 3: final ──► llm_final_tags    (any provider)
                  │
                  ▼
-        view claude_tag_votes  (final_tag by 2 of 3 votes)
+        view llm_tag_votes  (final_tag by 2 of 3 votes)
 ```
 
 ---
@@ -97,8 +97,8 @@ These are review files, produced by `export` or by SQL queries on the views. Not
 | File | Columns | Contents |
 |---|---|---|
 | `new-retagging-10000.csv` | `base_value, tag, model` | ~10,000 retagged items and their tags |
-| `new-retagging-errors.csv` | the full `claude_retags` columns | the few retags that failed |
-| `retagging-not-match.csv` | `claude_tag_comparison` columns up to `tag_2_model` | ~1,900 rows where pass 1 and pass 2 disagreed |
+| `new-retagging-errors.csv` | the full `llm_retags` columns | the few retags that failed |
+| `retagging-not-match.csv` | `llm_tag_comparison` columns up to `tag_2_model` | ~1,900 rows where pass 1 and pass 2 disagreed |
 | `retagging-not-match-final.csv` | the same, plus `is_alcoholic_1/2/any` | ~900 disagreeing rows used as pass 3 input |
 
 ### 2.3 `secrets/`: credentials
@@ -188,7 +188,7 @@ class TagResult:                         # one LLM decision
 
 ### 5.1 `config.py`: settings and LLM files
 
-- Load `.env` from the project root with `load_dotenv`.
+- Load `.env` from the project root with `load_dotenv(override=True)`, so `.env` wins over old values held by the terminal.
 - `Settings`: `database_url`, `google_credentials` (a relative path is resolved from the project root),
   `bigquery_table` (with the default shown above), `tag_workers` (default 4).
 - If credentials are set, write the absolute path back to `os.environ["GOOGLE_APPLICATION_CREDENTIALS"]`
@@ -419,7 +419,7 @@ It reuses `SYSTEM_PROMPT`, `RECORD_TAG_TOOL`, `candidates`, `user_message`, `_re
 `dispute_type`, `disputed_point`, `decision`, `final_tag`, `final_brand_label_name`, `final_is_alcoholic`, `explanation`.
 
 `_from_judge` turns it into `record_tag`'s fields. `HUMAN`, or a win for a side that skipped, is saved as a skip.
-`save_final` also stores `decision`, `dispute_type` and `disputed_point` in `claude_final_tags`.
+`save_final` also stores `decision`, `dispute_type` and `disputed_point` in `llm_final_tags`.
 
 **`is_misc(option)`**: true when the option, with `<` and `>` removed and trimmed, equals `MISC_OPTION`
 ignoring case. This also catches the `<Misc - not a Liquor>` spelling.
@@ -455,22 +455,22 @@ The old `claude_tags` table is left as it is: pass 1 now writes to `llm_tags`. T
 | `source_insert_dttm` | timestamptz | BigQuery insert time (the watermark) |
 | `tagged_at` | timestamptz, default now() | |
 
-#### Table `claude_retags`: pass 2
+#### Table `llm_retags`: pass 2
 
-`source_row_id` (PK), `base_value`, `first_tag` (not null; pass 1's tag at the time), `first_model`,
+`source_row_id` (PK), `base_value`, `first_tag` (pass 1's tag at the time; null when pass 1 skipped or failed), `first_model`,
 `tag`, `is_alcoholic`, `suggested_name`, `confidence`, `reason`, `sources`, `error`, `model`, `tagged_at`.
 A name pass 2 makes up itself is saved as the plain name, as in pass 1. Older rows may have `Others: <name>`.
 
-#### Table `claude_final_tags`: pass 3
+#### Table `llm_final_tags`: pass 3
 
 `source_row_id` (PK), `base_value`, `options` (exactly as shown to the model), `tag_1`, `tag_2`,
 `tag_1_model`, `tag_2_model`, `tag`, `selected_option`, `is_alcoholic`, `suggested_name`, `confidence`,
 `reason`, `judgements`, `sources`, `error`, `model`, `tagged_at`.
 
-#### View `claude_tag_comparison`
+#### View `llm_tag_comparison`
 
 ```sql
-CREATE OR REPLACE VIEW claude_tag_comparison AS
+CREATE OR REPLACE VIEW llm_tag_comparison AS
 WITH tags AS (
     SELECT
         t.source_row_id, t.base_value, t.options,
@@ -483,8 +483,8 @@ WITH tags AS (
         r.source_row_id IS NOT NULL AS retagged,
         f.tag AS tag_3, f.model AS tag_3_model, f.is_alcoholic AS is_alcoholic_3
     FROM llm_tags t
-    LEFT JOIN claude_retags r USING (source_row_id)
-    LEFT JOIN claude_final_tags f USING (source_row_id)
+    LEFT JOIN llm_retags r USING (source_row_id)
+    LEFT JOIN llm_final_tags f USING (source_row_id)
 )
 SELECT
     source_row_id, base_value, options, tag_1, tag_2,
@@ -505,18 +505,18 @@ confidence, reason, skip reason, error, sources and time, plus pass 1's selected
 `is_match` compares the tags ignoring case, outer spaces and `Others: `. A pass 2 skip is `false`. It's empty when pass 1
 gave no tag or pass 2 has no result yet (not reviewed, or failed).
 
-`needs_third_tag` is every row whose tags aren't a match, once pass 2 has tried it (even if it failed) or pass 1 skipped it.
+`needs_third_tag` is every row whose tags aren't a match, once pass 2 has tried it (even if it failed).
 `final` only reads these rows. Rows pass 2 hasn't tried yet are left out.
 
-#### View `claude_tag_votes`: the final answer
+#### View `llm_tag_votes`: the final answer
 
 ```sql
-CREATE OR REPLACE VIEW claude_tag_votes AS
+CREATE OR REPLACE VIEW llm_tag_votes AS
 WITH v AS (
     SELECT c.*,
            lower(trim(tag_3)) = lower(trim(tag_1)) AS tag_3_agrees_1,
            lower(trim(tag_3)) = lower(trim(tag_2)) AS tag_3_agrees_2
-    FROM claude_tag_comparison c
+    FROM llm_tag_comparison c
 )
 SELECT
     source_row_id, base_value, options, tag_1, tag_2, tag_3,
@@ -554,7 +554,7 @@ FROM v
 | `tagged_ids(include_errors)` | ids in `llm_tags` (optionally only the ones without an error) |
 | `save(row, result, model)` | upserts pass 1. Appends the suggested name to `options` when the tag is that name. |
 | `error_rows()` | pass 1 rows with an error, oldest first, **as stored**, including human edits |
-| `first_pass_rows()` | pass 1 rows with a tag, oldest first |
+| `first_pass_rows()` | all pass 1 rows, including skips and errors, oldest first |
 | `first_pass_models()` | the distinct models that tagged pass 1 rows |
 | `retagged_ids(include_errors)` / `save_retag(first, result, model)` | pass 2 |
 | `disputed_rows()` | `SELECT * FROM first_second_tag_comparison WHERE needs_third_tag ORDER BY source_row_id` |
@@ -589,7 +589,7 @@ FROM v
    made-up name is the tag with `Others: ` removed.
 3. `_from_review` turns the review into `record_tag`'s fields: `correct_answer` becomes the tag, and IGNORED, or
    "None of the above" with no name on an alcoholic item, becomes a skip.
-4. Skip rows already in `claude_retags`. Rows that failed are skipped too, unless `--retry-errors` is set.
+4. Skip rows already in `llm_retags`. Rows that failed are skipped too, unless `--retry-errors` is set.
 5. Save with `save_retag`.
 
 #### `final [--llm NAME]`: pass 3
@@ -600,7 +600,7 @@ FROM v
 
 #### `export PATH [--retags]`
 
-Writes `llm_tags`, or `claude_retags` with `--retags`, to a CSV file. `options` is joined with ` | `, and
+Writes `llm_tags`, or `llm_retags` with `--retags`, to a CSV file. `options` is joined with ` | `, and
 `judgements` and `sources` are written as JSON.
 
 #### The parallel loop (`_tag_rows`)
@@ -631,8 +631,8 @@ up. After a budget stop, tell the user to run again, adding `--full` for `run`.
 4. `claude_tagger.py`: the prompt, tool, request and `_result`. Try it on one hard-coded `SourceRow`.
 5. `__main__.py` with only `run --dry-run`. Check the JSON for 5 rows.
 6. `store.py` with `llm_tags`, then `run` without `--dry-run`, then `export`.
-7. `openai_tagger.py`, then `retag` and `claude_retags`, then the `claude_tag_comparison` view.
-8. `final_tagger.py`, then `final`, `claude_final_tags` and the `claude_tag_votes` view.
+7. `openai_tagger.py`, then `retag` and `llm_retags`, then the `llm_tag_comparison` view.
+8. `final_tagger.py`, then `final`, `llm_final_tags` and the `llm_tag_votes` view.
 9. A README.
 
 ---
@@ -649,8 +649,8 @@ up. After a budget stop, tell the user to run again, adding `--full` for `run`.
 - [ ] `--max-cost 0.01` → the run stops early, and unreached rows aren't saved.
 - [ ] Running `run` twice → the second run tags nothing new and costs nothing.
 - [ ] Edit a row in Postgres, then `run` → the edit is kept.
-- [ ] `retag` uses the other provider. `claude_tag_comparison.tags_match` ignores case, spaces and `Others: `.
-- [ ] `final` only touches rows with `needs_third_tag`. `claude_tag_votes.decision` gives a value for every row.
+- [ ] `retag` uses the other provider. `llm_tag_comparison.tags_match` ignores case, spaces and `Others: `.
+- [ ] `final` only touches rows with `needs_third_tag`. `llm_tag_votes.decision` gives a value for every row.
 
 ---
 
