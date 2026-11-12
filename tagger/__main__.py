@@ -1,11 +1,14 @@
-"""Command line: python -m tagger run | retag | final | export."""
+"""Command line: python -m tagger run | rerun | retag | final | export."""
 import argparse
 import csv
 import json
+import os
+import signal
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from itertools import islice
+from pathlib import Path
 
 from .bigquery_source import FetchStats, SourceRow, fetch_csv, fetch_rows, read_csv
 from .budget import Budget, BudgetExceeded
@@ -19,6 +22,9 @@ RETAG_PREFERENCE = ("gemini", "anthropic", "openai")
 
 
 def _tagger(llm, budget, **kw):
+    if llm.base_url:
+        from .gemini_web_tagger import GeminiWebTagger
+        return GeminiWebTagger(llm, budget, **kw)
     if llm.provider == "openai":
         from .openai_tagger import OpenAITagger
         return OpenAITagger(llm, budget, **kw)
@@ -28,6 +34,14 @@ def _tagger(llm, budget, **kw):
     return ClaudeTagger(llm, budget, **kw)
 
 
+def _stop_on_ctrl_c():
+    """Exit at once on Ctrl+C. A normal exit would wait for every queued LLM call, then throw their results away."""
+    def stop(*_):
+        print("\nStopped. Saved rows are kept, and the next run picks up the rest.", file=sys.stderr, flush=True)
+        os._exit(130)  # Postgres rolls back a save that was in progress
+    signal.signal(signal.SIGINT, stop)
+
+
 def _tag_rows(rows, tag, workers):
     """Tag rows in parallel windows of workers x 4. Yields (row, result); result is None after a budget stop."""
     rows = iter(rows)
@@ -35,12 +49,16 @@ def _tag_rows(rows, tag, workers):
     with ThreadPoolExecutor(max_workers=workers) as pool:
         while not over_budget and (window := list(islice(rows, workers * 4))):
             futures = {pool.submit(tag, row): row for row in window}
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                except BudgetExceeded:
-                    over_budget, result = True, None
-                yield futures[future], result
+            pending = set(futures)
+            while pending:
+                # needs a timeout: on Windows, Ctrl+C can't interrupt a wait without one
+                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
+                    try:
+                        result = future.result()
+                    except BudgetExceeded:
+                        over_budget, result = True, None
+                    yield futures[future], result
 
 
 def _store(settings):
@@ -137,6 +155,37 @@ def cmd_run(args, settings):
              skipped=skipped, failed=failed)
 
 
+# rerun: pass 1 again, on the rows already in llm_tags, with another prompt and its own table
+
+def cmd_rerun(args, settings):
+    prompt = Path(__file__).parent / args.prompt
+    if not prompt.is_file():
+        sys.exit(f"No prompt file {prompt}")
+    llm = load_llm_config(args.llm)
+    budget = Budget(args.max_cost)
+    tagger = _tagger(llm, budget, effort=args.effort or llm.effort, web_search=not args.no_web_search,
+                     system_prompt=prompt.read_text(encoding="utf-8"))
+    store = _store(settings)
+    table = None
+    if not args.dry_run:
+        try:
+            table = store.tags_table(args.table)
+        except ValueError as e:
+            sys.exit(f"--table {e}")
+    done = store.tagged_ids(include_errors=not args.retry_errors, table=table) if table is not None else set()
+    firsts = [r for r in store.first_pass_rows() if r["source_row_id"] not in done]
+    # first_pass_output drops a name pass 1 made up, so the model sees the original catalogue options
+    rows = (SourceRow(r["source_row_id"], r["base_value"], first_pass_output(r)[0], r["source_insert_dttm"])
+            for r in firsts)
+
+    print(f"Pass 1 rows -> {tagger.model} with {prompt.name}, saved to {args.table}", file=sys.stderr)
+    tagged, skipped, failed, stopped = _run_loop(
+        _limited(rows, args.limit), tagger.tag,
+        lambda row, result: store.save(row, result, tagger.model, table=table), args, budget, lambda row: tagger.model)
+    _summary(budget, stopped, "same command", first_pass_rows=len(firsts) + len(done), already_done=len(done),
+             tagged=tagged, skipped=skipped, failed=failed)
+
+
 # retag: pass 2
 
 def _retag_configs(names):
@@ -174,11 +223,17 @@ def _retag_request(first: dict) -> tuple[SourceRow, str]:
 
 
 def cmd_retag(args, settings):
+    from .store import llm_retags, llm_tags
     store = _store(settings)
+    try:
+        source = llm_tags if args.source == llm_tags.name else store.tags_table(args.source, like=llm_tags)
+        target = llm_retags if args.table == llm_retags.name else store.tags_table(args.table, like=llm_retags)
+    except ValueError as e:
+        sys.exit(f"--from/--table {e}")
     configs = _retag_configs(args.llm)
     budget = Budget(args.max_cost)
 
-    models = store.first_pass_models()
+    models = store.first_pass_models(source)
     route = {}
     for model in models:
         provider = _other_provider(model, configs)
@@ -194,8 +249,9 @@ def cmd_retag(args, settings):
     for model, provider in route.items():
         print(f"Pass 1 rows by {model} -> retagged by {taggers[provider].model}", file=sys.stderr)
 
-    done = store.retagged_ids(include_errors=not args.retry_errors)
-    firsts = {r["source_row_id"]: r for r in store.first_pass_rows() if r["source_row_id"] not in done}
+    print(f"{source.name} -> {target.name}", file=sys.stderr)
+    done = store.retagged_ids(include_errors=not args.retry_errors, table=target)
+    firsts = {r["source_row_id"]: r for r in store.first_pass_rows(source) if r["source_row_id"] not in done}
     already = len(done)
 
     def tagger_for(row):
@@ -205,7 +261,7 @@ def cmd_retag(args, settings):
     tagged, skipped, failed, stopped = _run_loop(
         _limited((row for row, _ in requests.values()), args.limit),
         lambda row: tagger_for(row).tag(row, note=requests[row.source_row_id][1]),
-        lambda row, result: store.save_retag(firsts[row.source_row_id], result, tagger_for(row).model),
+        lambda row, result: store.save_retag(firsts[row.source_row_id], result, tagger_for(row).model, table=target),
         args, budget, lambda row: tagger_for(row).model)
     _summary(budget, stopped, "same command", first_pass_rows=len(firsts) + already, already_retagged=already,
              tagged=tagged, skipped=skipped, failed=failed)
@@ -264,6 +320,7 @@ def cmd_export(args, settings):
 
 
 def main(argv=None):
+    _stop_on_ctrl_c()
     settings = load_settings()
     parser = argparse.ArgumentParser(prog="python -m tagger", description="Tag liquor products with LLMs.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -286,8 +343,16 @@ def main(argv=None):
     p.add_argument("--csv", metavar="PATH", help="read rows from a CSV export of topk_options instead of BigQuery")
     p.set_defaults(func=cmd_run)
 
+    p = tagging("rerun", "pass 1 again on the rows in llm_tags, with another prompt, into another table")
+    p.add_argument("--llm", required=True, help="LLM file in secrets/, e.g. claude, chatgpt or gemini")
+    p.add_argument("--prompt", required=True, metavar="FILE", help="prompt file in tagger/, e.g. system_prompt_v2.md")
+    p.add_argument("--table", required=True, help="table to save to, e.g. llm_tags_v2 (created if missing)")
+    p.set_defaults(func=cmd_rerun)
+
     p = tagging("retag", "pass 2: tag pass 1 rows again with another provider")
     p.add_argument("--llm", action="append", help="LLM file to retag with; repeat for several providers")
+    p.add_argument("--from", dest="source", default="llm_tags", help="pass 1 table to retag, e.g. llm_tags_v2")
+    p.add_argument("--table", default="llm_retags", help="table to save to, e.g. llm_retags_v2 (created if missing)")
     p.set_defaults(func=cmd_retag)
 
     p = tagging("final", "pass 3: settle rows where passes 1 and 2 disagree")

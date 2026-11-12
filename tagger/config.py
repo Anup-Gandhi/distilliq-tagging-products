@@ -54,6 +54,7 @@ class LLMConfig:
     output_price: float  # USD per 1M output tokens
     search_price: float  # USD per web search
     effort: str = DEFAULT_EFFORT  # low | medium | high
+    base_url: str | None = None   # set for a local OpenAI-style proxy, e.g. the Gemini-web one
 
 
 def provider_of_key(api_key: str) -> str | None:
@@ -135,7 +136,8 @@ def load_llm_config(name: str) -> LLMConfig:
     if effort not in EFFORTS:
         sys.exit(f"{path}: effort is '{effort}' (use {', '.join(EFFORTS)})")
 
-    return LLMConfig(path.stem, provider, model, api_key, input_price, output_price, search_price, effort)
+    return LLMConfig(path.stem, provider, model, api_key, input_price, output_price, search_price, effort,
+                     data.get("base_url") or None)
 
 
 def find_llm_configs(provider: str) -> list[Path]:

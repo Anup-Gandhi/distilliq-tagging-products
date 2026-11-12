@@ -1,4 +1,5 @@
 """Postgres: the source of truth for every pass."""
+import re
 from pathlib import Path
 
 from sqlalchemy import (ARRAY, Boolean, Column, DateTime, MetaData, String, Table, Text, create_engine, func,
@@ -396,10 +397,18 @@ class Store:
         with self.engine.connect() as conn:
             return conn.execute(select(func.max(llm_tags.c.source_insert_dttm))).scalar()
 
-    def tagged_ids(self, include_errors: bool = True) -> set[str]:
-        return self._ids(llm_tags, include_errors)
+    def tagged_ids(self, include_errors: bool = True, table: Table = llm_tags) -> set[str]:
+        return self._ids(table, include_errors)
 
-    def save(self, row: SourceRow, result: TagResult, model: str) -> None:
+    def tags_table(self, name: str, like: Table = llm_tags) -> Table:
+        """A table shaped like `like` (llm_tags by default), created if missing, for rerunning a pass elsewhere."""
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", name) or name in metadata.tables:
+            raise ValueError(f"{name!r}: use lowercase letters, digits and _, and not one of {sorted(metadata.tables)}")
+        table = like.to_metadata(MetaData(), name=name)
+        table.create(self.engine, checkfirst=True)
+        return table
+
+    def save(self, row: SourceRow, result: TagResult, model: str, table: Table = llm_tags) -> None:
         options = list(row.options)
         # A suggested name becomes one more option, so the tag always reads like a candidate.
         if result.tag and result.tag == result.suggested_name and result.tag not in options:
@@ -408,7 +417,7 @@ class Store:
                   "selected_option": result.selected_option, "judgements": result.judgements or [],
                   "model": model, "source_insert_dttm": row.insert_dttm, **_decision_values(result)}
         with self.engine.begin() as conn:
-            _upsert(conn, llm_tags, values)
+            _upsert(conn, table, values)
 
     def error_rows(self) -> list[dict]:
         """Failed pass 1 rows, oldest first, as stored (including human edits)."""
@@ -416,25 +425,25 @@ class Store:
                      .order_by(llm_tags.c.source_insert_dttm.asc().nulls_first(), llm_tags.c.source_row_id))
         return self._rows(statement)
 
-    def first_pass_rows(self) -> list[dict]:
-        statement = select(llm_tags).order_by(llm_tags.c.source_insert_dttm.asc().nulls_first(), llm_tags.c.source_row_id)
+    def first_pass_rows(self, table: Table = llm_tags) -> list[dict]:
+        statement = select(table).order_by(table.c.source_insert_dttm.asc().nulls_first(), table.c.source_row_id)
         return self._rows(statement)
 
-    def first_pass_models(self) -> list[str]:
+    def first_pass_models(self, table: Table = llm_tags) -> list[str]:
         with self.engine.connect() as conn:
-            return list(conn.execute(select(llm_tags.c.model).distinct()).scalars())
+            return list(conn.execute(select(table.c.model).distinct()).scalars())
 
     # Pass 2
 
-    def retagged_ids(self, include_errors: bool = True) -> set[str]:
-        return self._ids(llm_retags, include_errors)
+    def retagged_ids(self, include_errors: bool = True, table: Table = llm_retags) -> set[str]:
+        return self._ids(table, include_errors)
 
-    def save_retag(self, first: dict, result: TagResult, model: str) -> None:
+    def save_retag(self, first: dict, result: TagResult, model: str, table: Table = llm_retags) -> None:
         values = {"source_row_id": first["source_row_id"], "base_value": first["base_value"],
                   "first_tag": first["tag"], "first_model": first["model"], "model": model,
                   **_decision_values(result)}
         with self.engine.begin() as conn:
-            _upsert(conn, llm_retags, values)
+            _upsert(conn, table, values)
 
     # Pass 3
 

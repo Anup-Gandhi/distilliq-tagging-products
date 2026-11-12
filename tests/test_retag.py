@@ -1,8 +1,11 @@
 import json
+import subprocess
+import sys
 
 from types import SimpleNamespace
 
-from tagger.__main__ import _retag_request
+from tagger.__main__ import _retag_request, _tag_rows
+from tagger.budget import BudgetExceeded
 from tagger.claude_tagger import ClaudeTagger, _result, user_message
 from tagger.final_tagger import disputed_request
 
@@ -42,6 +45,26 @@ def test_old_others_row_and_misc_row():
     assert (output(note)["answer"], output(note)["brand_label_name"]) == ("None of the above", "Titos Vodka")
     _, note = _retag_request(first(tag="<Misc - not a Liquor>", selected_option=None, is_alcoholic=False))
     assert output(note)["answer"] == "Misc - Not a Liquor"
+
+
+def test_tag_rows_yields_every_row_and_stops_on_budget():
+    assert sorted(_tag_rows(range(10), lambda r: r * 2, 2)) == [(r, r * 2) for r in range(10)]
+
+    def over(_):
+        raise BudgetExceeded()
+    # one window of workers x 4 is already queued, then no more are started
+    assert sorted(_tag_rows(range(100), over, 1)) == [(r, None) for r in range(4)]
+
+
+def test_ctrl_c_stops_without_waiting_for_workers():
+    code = ("import signal, threading, time\n"
+            "from tagger.__main__ import _stop_on_ctrl_c, _tag_rows\n"
+            "_stop_on_ctrl_c()\n"
+            "threading.Timer(0.5, signal.raise_signal, [signal.SIGINT]).start()\n"
+            "list(_tag_rows(range(4), lambda r: time.sleep(30), 4))\n")
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=20)
+    assert done.returncode == 130, done.stderr
+    assert "Stopped." in done.stderr
 
 
 def test_row_with_no_first_tag_can_be_reviewed():
@@ -130,3 +153,11 @@ def test_json_written_as_text_counts_as_the_answer():
         assert "No decision recorded" in str(e)
     else:
         raise AssertionError("expected a TaggingError")
+
+
+def test_rerun_table_name_is_checked_before_touching_the_database():
+    import pytest
+    from tagger.store import Store
+    for bad in ("llm_tags", "csv_records", "Bad-Name", "x; drop table llm_tags", ""):
+        with pytest.raises(ValueError):
+            Store.tags_table(None, bad)
